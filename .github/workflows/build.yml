@@ -19,20 +19,20 @@ jobs:
             kind: linux
             artifact: entropy-linux
             binary: target/release/entropy
-          - os: windows-latest
-            kind: windows
-            artifact: entropy-windows
-            binary: target/release/entropy.exe
-          - os: macos-15
-            kind: macos
-            artifact: entropy-macos-arm64
-            binary: dist/macos/*.app.zip
-            target: aarch64-apple-darwin
-          - os: macos-15-intel
-            kind: macos
-            artifact: entropy-macos-x86_64
-            binary: dist/macos/*.app.zip
-            target: x86_64-apple-darwin
+#          - os: windows-latest
+#            kind: windows
+#            artifact: entropy-windows
+#            binary: target/release/entropy.exe
+#          - os: macos-15
+#            kind: macos
+#            artifact: entropy-macos-arm64
+#            binary: dist/macos/*.app.zip
+#            target: aarch64-apple-darwin
+#          - os: macos-15-intel
+#            kind: macos
+#            artifact: entropy-macos-x86_64
+#            binary: dist/macos/*.app.zip
+#            target: x86_64-apple-darwin
 
     steps:
       - uses: actions/checkout@v4
