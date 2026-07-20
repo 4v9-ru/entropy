@@ -71,6 +71,11 @@ fn hid_lifecycle_writes_available(hid_write_task_active: bool) -> bool {
     !hid_write_task_active
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn connection_replaces_layout_canvas(connect_state: &ConnectState) -> bool {
+    matches!(connect_state, ConnectState::Loading { .. })
+}
+
 impl EntropyApp {
     fn main_window_hidden_to_tray(&self) -> bool {
         #[cfg(target_os = "windows")]
@@ -96,16 +101,17 @@ impl EntropyApp {
         selected_device_is_bluetooth: bool,
     ) {
         self.poll_settings_write(ctx);
+        self.flush_due_qmk_setting_writes();
         if should_poll_device_scan(main_window_hidden_to_tray) {
-            if hid_lifecycle_writes_available(self.hid_write_task_active()) {
+            if hid_lifecycle_writes_available(self.hid_write_lifecycle_busy()) {
                 self.handle_pending_imports(ctx, now);
             }
-            if !self.hid_write_task_active() {
+            if !self.hid_write_lifecycle_busy() {
                 self.poll_device_scan(ctx);
             }
 
             let is_connecting = matches!(self.connect_state, ConnectState::Loading { .. });
-            let hid_write_active = self.hid_write_task_active();
+            let hid_write_active = self.hid_write_lifecycle_busy();
             #[cfg(target_os = "macos")]
             let hid_session_active = self.hid_device.is_some();
             #[cfg(not(target_os = "macos"))]
@@ -155,7 +161,21 @@ impl EntropyApp {
             return;
         }
 
-        if let Some(path) = self.pending_entlayout_import_path.take() {
+        if let Some((path, opened_generation)) = self.pending_entlayout_import_path.take() {
+            if super::file_dialog::device_generation_stale(
+                opened_generation,
+                self.connection_generation,
+            ) {
+                // The device changed between choosing the file and this deferred
+                // write; do not program the new device with the old one's import.
+                self.status_msg = crate::i18n::tr_catalog(
+                    self.app_settings.language,
+                    "status_messages.file_dialog_device_changed",
+                )
+                .into();
+                self.import_progress_started_at = None;
+                return;
+            }
             match self.import_entlayout_from_path(&path) {
                 Ok(report) => {
                     self.status_msg = crate::i18n::tr_catalog(
@@ -407,6 +427,22 @@ mod tests {
     use super::super::settings_write_queue::SettingsWriteStatus;
     use super::*;
     use crate::keyboard::{KeyboardLayout, LayoutOption, PhysicalKey};
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn only_device_connection_replaces_the_layout_canvas() {
+        let idle = ConnectState::Idle;
+        assert!(!connection_replaces_layout_canvas(&idle));
+
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        let now = std::time::Instant::now();
+        let loading = ConnectState::Loading {
+            rx: receiver,
+            started_at: now,
+            last_progress_at: now,
+        };
+        assert!(connection_replaces_layout_canvas(&loading));
+    }
 
     #[test]
     fn dirty_dynamic_entries_write_over_bluetooth() {
@@ -968,6 +1004,9 @@ impl eframe::App for EntropyApp {
             self.cache_windows_hwnd(frame);
             #[cfg(target_os = "macos")]
             self.cache_macos_ns_window(frame);
+            // Cache the winit window/display handles so native file dialogs can be
+            // parented to the main window instead of opening behind it.
+            self.cache_parent_window_handles(frame);
             #[cfg(any(target_os = "windows", target_os = "macos"))]
             self.handle_tray_quit_request(ctx);
             #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -1062,6 +1101,11 @@ impl eframe::App for EntropyApp {
             self.last_applied_theme = Some((self.dark_mode, accent_color));
         }
 
+        // Deliver results from any background file dialog (import/export pickers
+        // run off the UI thread so the portal round-trip never freezes egui).
+        #[cfg(not(target_arch = "wasm32"))]
+        self.poll_file_dialog(ctx);
+
         self.apply_picker_results();
 
         // Deselect key when picker is closed without choosing
@@ -1109,10 +1153,10 @@ impl eframe::App for EntropyApp {
             });
         }
 
-        // Check if loading
+        // Only a device connection replaces the canvas. Background HID writes keep the
+        // current layer visible until their result is applied.
         #[cfg(not(target_arch = "wasm32"))]
-        let is_loading = matches!(self.connect_state, ConnectState::Loading { .. })
-            || self.hid_write_task_active();
+        let is_loading = connection_replaces_layout_canvas(&self.connect_state);
         #[cfg(target_arch = "wasm32")]
         let is_loading = false;
 
@@ -1579,6 +1623,7 @@ impl eframe::App for EntropyApp {
         }
 
         if !hid_write_task_active {
+            self.flush_due_qmk_setting_writes();
             self.flush_due_tap_hold_numeric_writes();
         }
 

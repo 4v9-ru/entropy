@@ -446,7 +446,7 @@ fn supports_vial_macro_ext_keycodes(vial_protocol: u32, json: &serde_json::Value
 impl EntropyApp {
     pub(super) fn refresh_current_device_data(&mut self) {
         let lang = self.app_settings.language;
-        if self.hid_write_task_active() {
+        if self.hid_write_lifecycle_busy() {
             self.status_msg =
                 crate::i18n::tr_catalog(lang, "status_messages.refresh_device_data_pending_write")
                     .to_owned();
@@ -486,8 +486,17 @@ impl EntropyApp {
 
     pub(super) fn start_connect(&mut self, device_idx: usize) {
         if self.hid_write_task_active() {
+            self.pending_device_connect = Some(device_idx);
             return;
         }
+        if self.qmk_settings_write_pending() {
+            self.pending_device_connect = Some(device_idx);
+            self.flush_pending_qmk_setting_writes();
+            if self.qmk_settings_write_busy() {
+                return;
+            }
+        }
+        self.pending_device_connect = None;
         let dev = match self.device_manager.devices().get(device_idx) {
             Some(d) => d.clone(),
             None => {
@@ -504,7 +513,8 @@ impl EntropyApp {
         self.layer_write_task = None;
         self.combo_write_task = None;
         self.settings_write_task = None;
-        self.settings_write_queue.clear();
+        self.reset_settings_write_context();
+        self.qmk_settings_write_queue.clear();
         self.hid_device = None;
         self.undo_stack.clear();
         self.device_about_info = None;
@@ -762,6 +772,7 @@ impl EntropyApp {
                 }
                 layout.layer_names.truncate(layer_count);
                 let mut current_firmware_layer_names = vec![None; layer_count];
+                let mut layer_names_from_firmware = vec![false; layer_count];
                 if has_qmk_setting(200) {
                     for (layer, current_firmware_name) in
                         current_firmware_layer_names.iter_mut().enumerate()
@@ -775,6 +786,7 @@ impl EntropyApp {
                                 *current_firmware_name = Some(name.clone());
                                 if !name.is_empty() {
                                     layout.layer_names[layer] = name;
+                                    layer_names_from_firmware[layer] = true;
                                 }
                             }
                             Err(e) => {
@@ -1327,6 +1339,7 @@ impl EntropyApp {
                     keyboard_id,
                     hid_device: Some(dev_conn),
                     about_info,
+                    layer_names_from_firmware,
                     macro_texts,
                     supports_macro_ext_keycodes,
                     macro_ext_keycodes_disabled_reason,
@@ -1351,11 +1364,21 @@ impl EntropyApp {
                     vial_features,
                     layout,
                     layer_count,
+                    supported_qmk_settings,
                 })
             })();
 
             let _ = tx.send(ConnectTaskMessage::Done(Box::new(result)));
         });
+    }
+
+    pub(super) fn resume_pending_device_connect(&mut self) {
+        if self.layer_write_task.is_some() || self.qmk_settings_write_busy() {
+            return;
+        }
+        if let Some(device_idx) = self.pending_device_connect.take() {
+            self.start_connect(device_idx);
+        }
     }
 }
 

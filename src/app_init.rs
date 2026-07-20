@@ -32,13 +32,18 @@ impl EntropyApp {
             hid_device: None,
             #[cfg(not(target_arch = "wasm32"))]
             layer_write_task: None,
+            qmk_settings_write_queue: QmkSettingsWriteQueue::default(),
             #[cfg(not(target_arch = "wasm32"))]
             combo_write_task: None,
             settings_write_task: None,
             settings_write_queue: SettingsWriteQueueState::default(),
+            settings_write_generation: 0,
             #[cfg(not(target_arch = "wasm32"))]
             qmk_hid_hosts: std::collections::HashMap::new(),
+            pending_device_connect: None,
             firmware: FirmwareProtocol::Vial,
+            #[cfg(not(target_arch = "wasm32"))]
+            supported_qmk_settings: Vec::new(),
             undo_stack: Vec::new(),
             layer_clipboard: None,
             scan_frame: 0,
@@ -65,6 +70,10 @@ impl EntropyApp {
             import_report_title: String::new(),
             import_report_body: String::new(),
             pending_entlayout_import_path: None,
+            pending_file_dialog: None,
+            connection_generation: 0,
+            parent_window_handle: None,
+            parent_display_handle: None,
             pending_entsettings_import_path: None,
             import_progress_started_at: None,
             import_progress_title: String::new(),

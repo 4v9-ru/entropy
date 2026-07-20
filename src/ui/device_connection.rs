@@ -22,8 +22,28 @@ fn select_keyboard_hint(lang: crate::i18n::Language, has_error: bool) -> &'stati
     }
 }
 
+fn device_selection_list_size(
+    panel_width: f32,
+    adaptive_width: f32,
+    device_count: usize,
+) -> egui::Vec2 {
+    let visible_rows = device_count.clamp(1, 6);
+    egui::vec2(
+        panel_width.min(adaptive_width),
+        12.0 + visible_rows as f32 * 30.0,
+    )
+}
+
+fn device_selection_needs_scroll(device_count: usize) -> bool {
+    device_count > 6
+}
+
 impl EntropyApp {
     pub(super) fn clear_connected_keyboard_state(&mut self, status_msg: impl Into<String>) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.connection_generation = self.connection_generation.wrapping_add(1);
+        }
         self.layout = None;
         self.selected_key = None;
         self.selected_encoder = None;
@@ -33,8 +53,12 @@ impl EntropyApp {
         self.layer_write_task = None;
         self.combo_write_task = None;
         self.settings_write_task = None;
-        self.settings_write_queue.clear();
+        self.reset_settings_write_context();
+        self.cancel_pending_qmk_setting_writes();
+        self.qmk_settings_write_queue.clear();
+        self.pending_device_connect = None;
         self.hid_device = None;
+        self.supported_qmk_settings.clear();
         self.undo_stack.clear();
         self.connect_state = ConnectState::Idle;
         self.unlock_open = false;
@@ -95,11 +119,12 @@ impl EntropyApp {
             })
             .collect();
         let has_error = !self.status_msg.trim().is_empty();
-        let list_rows = devices.len().min(6).max(1);
-        let list_height = 12.0 + list_rows as f32 * 30.0;
         let status_height = if has_error { 38.0 } else { 0.0 };
         let panel_width = rect.width().min(520.0);
-        let panel_height = 110.0 + status_height + list_height;
+        let adaptive_list_width =
+            adaptive_top_dropdown_width(ui, devices.iter().map(|(_, label)| label.as_str()), 220.0);
+        let list_size = device_selection_list_size(panel_width, adaptive_list_width, devices.len());
+        let panel_height = 110.0 + status_height + list_size.y;
         let max_panel_height = (rect.height() - 32.0).max(120.0);
         let panel_rect = egui::Rect::from_center_size(
             rect.center(),
@@ -143,24 +168,56 @@ impl EntropyApp {
                 }
 
                 ui.add_space(14.0);
-                top_dropdown_frame(dark).show(ui, |ui| {
-                    let item_width = panel_width.min(360.0) - 16.0;
-                    egui::ScrollArea::vertical()
-                        .max_height(list_height)
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
+                let (list_rect, _) = ui.allocate_exact_size(list_size, Sense::hover());
+                crate::ui_style::allocate_ui_at_rect(ui, list_rect, |ui| {
+                    let mut selected_device = None;
+                    top_dropdown_frame(dark).show(ui, |ui| {
+                        let item_width = list_size.x - 16.0;
+                        let mut draw_device_items = |ui: &mut egui::Ui| {
                             ui.set_width(item_width);
-                            for (idx, label) in devices {
-                                if top_dropdown_item(ui, item_width, &label, true, false).clicked()
-                                {
-                                    self.selected_device = Some(idx);
-                                    self.main_menu_tab = MainMenuTab::Keyboard;
-                                    self.start_connect(idx);
+                            for (idx, label) in &devices {
+                                if top_dropdown_item(ui, item_width, label, true, false).clicked() {
+                                    selected_device = Some(*idx);
                                 }
                             }
-                        });
+                        };
+
+                        if device_selection_needs_scroll(devices.len()) {
+                            egui::ScrollArea::vertical()
+                                .max_height(list_size.y - 12.0)
+                                .auto_shrink([false, true])
+                                .show(ui, &mut draw_device_items);
+                        } else {
+                            draw_device_items(ui);
+                        }
+                    });
+                    if let Some(idx) = selected_device {
+                        self.selected_device = Some(idx);
+                        self.main_menu_tab = MainMenuTab::Keyboard;
+                        self.start_connect(idx);
+                    }
                 });
             });
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn device_selection_list_stays_compact_and_caps_visible_rows() {
+        assert_eq!(
+            device_selection_list_size(520.0, 220.0, 1),
+            egui::vec2(220.0, 42.0)
+        );
+        assert_eq!(
+            device_selection_list_size(520.0, 360.0, 12),
+            egui::vec2(360.0, 192.0)
+        );
+        assert!(!device_selection_needs_scroll(1));
+        assert!(!device_selection_needs_scroll(6));
+        assert!(device_selection_needs_scroll(7));
     }
 }

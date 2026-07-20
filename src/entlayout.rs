@@ -324,14 +324,29 @@ impl EntropyApp {
             return;
         };
         let file_name = format!("{}.entlayout", device_id_slug(&bundle.keyboard.name));
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("Entropy layout", &["entlayout"])
-            .set_file_name(&file_name)
-            .save_file()
-        else {
+        // The picker runs on a worker thread; the actual write happens in
+        // write_entlayout_export once a path comes back. Snapshotting again then
+        // keeps the export current even if the dialog was open for a while.
+        self.spawn_file_dialog(
+            crate::app::file_dialog::FileDialogAction::ExportEntlayout,
+            rfd::FileDialog::new()
+                .add_filter("Entropy layout", &["entlayout"])
+                .set_file_name(&file_name),
+            true,
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn write_entlayout_export(&mut self, path: &Path) {
+        let Some(bundle) = self.entlayout_snapshot() else {
+            self.status_msg = crate::i18n::tr_catalog(
+                self.app_settings.language,
+                "entlayout.connect_keyboard_before_exporting_layout",
+            )
+            .into();
             return;
         };
-        match write_entlayout_file(&path, &bundle, self.app_settings.language) {
+        match write_entlayout_file(path, &bundle, self.app_settings.language) {
             Ok(()) => {
                 self.status_msg = crate::i18n::tr_catalog_format(
                     self.app_settings.language,
@@ -351,13 +366,18 @@ impl EntropyApp {
 
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn import_entlayout_dialog(&mut self) {
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("Entropy layout", &["entlayout"])
-            .pick_file()
-        else {
-            return;
-        };
-        self.pending_entlayout_import_path = Some(path);
+        self.spawn_file_dialog(
+            crate::app::file_dialog::FileDialogAction::ImportEntlayout,
+            rfd::FileDialog::new().add_filter("Entropy layout", &["entlayout"]),
+            false,
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn begin_entlayout_import(&mut self, path: std::path::PathBuf) {
+        // Remember which connection this import belongs to; the deferred write
+        // in handle_pending_imports re-checks it before touching the device.
+        self.pending_entlayout_import_path = Some((path, self.connection_generation));
         self.import_progress_started_at = None;
         self.import_progress_title =
             crate::i18n::tr_catalog(self.app_settings.language, "entlayout.importing_layout")
@@ -644,9 +664,39 @@ impl EntropyApp {
         bundle: &EntLayoutFile,
     ) -> Result<(Vec<String>, EntLayoutImportMapping)> {
         let mapping = self.entlayout_import_mapping(bundle)?;
-        let firmware_failures = self.apply_entlayout_firmware_state(bundle, &mapping)?;
+        let mut firmware_failures = self.apply_entlayout_firmware_state(bundle, &mapping)?;
         self.apply_entlayout_local_state(bundle, &mapping)?;
         self.refresh_layer_picker_content_flags();
+
+        // Persist the imported layer names into firmware now that self.layer_names
+        // holds the final target values. The shared writer continues past a
+        // failing layer and reports which ones failed, so stale firmware slots
+        // aren't left to win over the local names on the next reconnect.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let names = self.layer_names.clone();
+            let failed = self.write_layer_names_to_firmware(&names);
+            if !failed.is_empty() {
+                let lang = self.app_settings.language;
+                let layers = failed
+                    .iter()
+                    .map(|layer| layer.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                firmware_failures.push(crate::i18n::tr_catalog_format(
+                    lang,
+                    "entlayout.firmware_failure",
+                    &[
+                        (
+                            "section",
+                            crate::i18n::tr_catalog(lang, "entlayout.layer_names"),
+                        ),
+                        ("error", &format!("layers {layers}")),
+                    ],
+                ));
+            }
+        }
+
         Ok((firmware_failures, mapping))
     }
 
@@ -1007,6 +1057,10 @@ impl EntropyApp {
                 ],
             ));
         }
+
+        // Layer names are written after local state sets self.layer_names, via
+        // the shared write_layer_names_to_firmware writer (see apply_entlayout),
+        // so a single failing layer no longer aborts the rest.
 
         if let Err(err) = (|| -> Result<()> {
             for (source_layer_idx, layer_codes) in bundle.data.encoder_keymap.iter().enumerate() {

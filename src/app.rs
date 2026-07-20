@@ -78,6 +78,8 @@ mod device_scan;
 mod device_settings_helpers;
 #[path = "ui/encoder_visibility_settings.rs"]
 mod encoder_visibility_settings_ui;
+#[path = "ui/file_dialog.rs"]
+mod file_dialog;
 #[path = "ui/grave_escape_settings.rs"]
 mod grave_escape_settings_ui;
 #[path = "ui/key_assignment.rs"]
@@ -139,6 +141,9 @@ mod module_settings_ui;
 mod mouse_keys_settings_ui;
 #[path = "ui/onboarding_tour.rs"]
 mod onboarding_tour;
+#[path = "ui/qmk_settings_write_queue.rs"]
+mod qmk_settings_write_queue;
+use qmk_settings_write_queue::QmkSettingsWriteQueue;
 #[path = "ui/rgb_settings.rs"]
 mod rgb_settings_ui;
 #[path = "ui/settings_shell.rs"]

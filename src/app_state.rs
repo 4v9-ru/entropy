@@ -361,6 +361,12 @@ pub(crate) struct ConnectResult {
     pub(crate) alt_repeat_entries: Vec<AltRepeatKeyEntry>,
     /// Feature bits reported by Vial dynamic entries.
     pub(crate) vial_features: VialFeatureSupport,
+    /// Per-layer flag: true where the firmware returned a stored layer name via
+    /// QSID read, so locally-saved names are only applied to the rest.
+    pub(crate) layer_names_from_firmware: Vec<bool>,
+    /// QMK setting ids the firmware exposes, so later layer-name writes can tell
+    /// unsupported storage apart from a transport error.
+    pub(crate) supported_qmk_settings: Vec<u16>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -2619,27 +2625,95 @@ pub(crate) enum LayoutImageExportTheme {
     Dark,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[derive(Default)]
 pub(crate) enum LayoutImageExportFormat {
     #[default]
     Png,
     Svg,
+    Pdf,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(
+    into = "LayoutImageExportStatePersisted",
+    from = "LayoutImageExportStatePersisted"
+)]
 pub(crate) struct LayoutImageExportState {
-    #[serde(default)]
     pub(crate) format: LayoutImageExportFormat,
-    #[serde(default)]
     pub(crate) theme: LayoutImageExportTheme,
-    #[serde(default)]
     pub(crate) key_legend_layout: KeyLegendLayout,
-    #[serde(default = "default_layout_image_export_show_layer_names")]
     pub(crate) show_layer_names: bool,
-    #[serde(default)]
     pub(crate) selected_layers: Vec<bool>,
+}
+
+/// The `png`/`svg` values a pre-PDF build (v0.2.0) can deserialize. PDF is
+/// stored out-of-band so older builds never choke on an unknown `format` and
+/// reset *all* app settings to defaults.
+#[derive(Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum BaseImageFormat {
+    #[default]
+    Png,
+    Svg,
+}
+
+/// On-disk shape of [`LayoutImageExportState`]. `format` stays within the values
+/// old builds understand; `export_pdf` is an extra field they silently ignore.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LayoutImageExportStatePersisted {
+    #[serde(default)]
+    format: BaseImageFormat,
+    #[serde(default)]
+    export_pdf: bool,
+    #[serde(default)]
+    theme: LayoutImageExportTheme,
+    #[serde(default)]
+    key_legend_layout: KeyLegendLayout,
+    #[serde(default = "default_layout_image_export_show_layer_names")]
+    show_layer_names: bool,
+    #[serde(default)]
+    selected_layers: Vec<bool>,
+}
+
+impl From<LayoutImageExportState> for LayoutImageExportStatePersisted {
+    fn from(state: LayoutImageExportState) -> Self {
+        let (format, export_pdf) = match state.format {
+            LayoutImageExportFormat::Png => (BaseImageFormat::Png, false),
+            LayoutImageExportFormat::Svg => (BaseImageFormat::Svg, false),
+            // Persist a safe base for old builds; the sidecar restores PDF here.
+            LayoutImageExportFormat::Pdf => (BaseImageFormat::Png, true),
+        };
+        Self {
+            format,
+            export_pdf,
+            theme: state.theme,
+            key_legend_layout: state.key_legend_layout,
+            show_layer_names: state.show_layer_names,
+            selected_layers: state.selected_layers,
+        }
+    }
+}
+
+impl From<LayoutImageExportStatePersisted> for LayoutImageExportState {
+    fn from(p: LayoutImageExportStatePersisted) -> Self {
+        let format = if p.export_pdf {
+            LayoutImageExportFormat::Pdf
+        } else {
+            match p.format {
+                BaseImageFormat::Png => LayoutImageExportFormat::Png,
+                BaseImageFormat::Svg => LayoutImageExportFormat::Svg,
+            }
+        };
+        Self {
+            format,
+            theme: p.theme,
+            key_legend_layout: p.key_legend_layout,
+            show_layer_names: p.show_layer_names,
+            selected_layers: p.selected_layers,
+        }
+    }
 }
 
 fn default_layout_image_export_show_layer_names() -> bool {
@@ -2679,8 +2753,33 @@ pub struct EntropyApp {
     pub(crate) import_report_open: bool,
     pub(crate) import_report_title: String,
     pub(crate) import_report_body: String,
+    /// In-flight native file dialog running on a background thread so the UI
+    /// thread never blocks on the (portal/D-Bus) picker. Only one at a time.
     #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) pending_entlayout_import_path: Option<std::path::PathBuf>,
+    pub(crate) pending_file_dialog: Option<(
+        super::file_dialog::FileDialogAction,
+        // Connection generation captured when the dialog was opened, so a
+        // device-scoped import/export can be rejected if the device changed
+        // while the picker was up.
+        u64,
+        std::sync::mpsc::Receiver<Option<std::path::PathBuf>>,
+    )>,
+    /// Bumped on every connect and disconnect. Used to detect that the active
+    /// device changed while a file dialog was open.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) connection_generation: u64,
+    /// Raw handles of the main window, cached each frame so file dialogs can be
+    /// parented to it — otherwise the native picker can open behind the window.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) parent_window_handle: Option<raw_window_handle::RawWindowHandle>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) parent_display_handle: Option<raw_window_handle::RawDisplayHandle>,
+    #[cfg(not(target_arch = "wasm32"))]
+    /// Deferred `.entlayout` import: the chosen path plus the connection
+    /// generation when it was chosen. The generation is re-checked just before
+    /// the firmware write so an import picked for device A is not applied to a
+    /// device B that connected in the meantime.
+    pub(crate) pending_entlayout_import_path: Option<(std::path::PathBuf, u64)>,
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) pending_entsettings_import_path: Option<std::path::PathBuf>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -2706,12 +2805,20 @@ pub struct EntropyApp {
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) settings_write_task: Option<SettingsWriteTask>,
     pub(super) settings_write_queue: SettingsWriteQueueState,
+    pub(super) settings_write_generation: u64,
+    pub(super) qmk_settings_write_queue: QmkSettingsWriteQueue,
+    pub(super) pending_device_connect: Option<usize>,
     /// Built-in qmk-hid-host bridges for displays/presets that need host data
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) qmk_hid_hosts:
         std::collections::HashMap<String, crate::qmk_hid_host::QmkHidHostBridge>,
     /// Current firmware type (mirrors layout.firmware)
     pub(crate) firmware: FirmwareProtocol,
+    /// QMK setting ids the connected firmware exposes (from the connect probe).
+    /// Used to tell "storage genuinely unsupported" apart from a transport error
+    /// when persisting layer names, so imports never report a false success.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) supported_qmk_settings: Vec<u16>,
     /// Undo stack for key, encoder, and whole-layer assignments
     pub(super) undo_stack: Vec<UndoAction>,
     /// In-memory whole-layer clipboard. Kept across device reconnects so keyboards
@@ -2961,5 +3068,66 @@ mod module_settings_state_tests {
         );
         assert_eq!(attempts, MODULE_SETTING_READBACK_ATTEMPTS);
         assert_eq!(settings.value(42), 7);
+    }
+}
+
+#[cfg(test)]
+mod layout_image_export_persist_tests {
+    use super::{LayoutImageExportFormat, LayoutImageExportState};
+
+    #[test]
+    fn pdf_persists_backward_compatibly() {
+        let mut state = LayoutImageExportState::default();
+        state.format = LayoutImageExportFormat::Pdf;
+        let json = serde_json::to_value(&state).unwrap();
+        // A pre-PDF build only understands png/svg for `format`; PDF is stored
+        // in the ignored `export_pdf` sidecar so it can't break their parsing.
+        assert_eq!(json["format"], "png");
+        assert_eq!(json["export_pdf"], true);
+    }
+
+    #[test]
+    fn png_and_svg_have_no_pdf_sidecar_set() {
+        for (fmt, expected) in [
+            (LayoutImageExportFormat::Png, "png"),
+            (LayoutImageExportFormat::Svg, "svg"),
+        ] {
+            let mut state = LayoutImageExportState::default();
+            state.format = fmt;
+            let json = serde_json::to_value(&state).unwrap();
+            assert_eq!(json["format"], expected);
+            assert_eq!(json["export_pdf"], false);
+        }
+    }
+
+    #[test]
+    fn round_trips_every_format() {
+        for fmt in [
+            LayoutImageExportFormat::Png,
+            LayoutImageExportFormat::Svg,
+            LayoutImageExportFormat::Pdf,
+        ] {
+            let mut state = LayoutImageExportState::default();
+            state.format = fmt;
+            let json = serde_json::to_string(&state).unwrap();
+            let back: LayoutImageExportState = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.format, fmt);
+        }
+    }
+
+    #[test]
+    fn reads_legacy_json_without_sidecar() {
+        // A v0.2.0 file: only png/svg, no export_pdf field.
+        let legacy = r#"{"format":"svg","theme":"dark","show_layer_names":false}"#;
+        let state: LayoutImageExportState = serde_json::from_str(legacy).unwrap();
+        assert_eq!(state.format, LayoutImageExportFormat::Svg);
+    }
+
+    #[test]
+    fn export_pdf_sidecar_wins_over_base_format() {
+        // Mirrors what a newer build writes; older base kept as png.
+        let json = r#"{"format":"png","export_pdf":true}"#;
+        let state: LayoutImageExportState = serde_json::from_str(json).unwrap();
+        assert_eq!(state.format, LayoutImageExportFormat::Pdf);
     }
 }
