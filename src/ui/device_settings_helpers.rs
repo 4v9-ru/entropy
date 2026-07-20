@@ -323,6 +323,29 @@ impl EntropyApp {
         ergohaven_macropad_display || name.contains("m4cr0pad v2") || name.contains("m4cr0pad v3")
     }
 
+    fn settings_title_words(title: &str) -> Vec<String> {
+        title
+            .split(|character: char| !character.is_ascii_alphanumeric())
+            .filter(|word| !word.is_empty())
+            .map(str::to_ascii_lowercase)
+            .collect()
+    }
+
+    fn is_generic_touchpad_settings_tab(tab: &serde_json::Value) -> bool {
+        let Some(title) = tab.get("name").and_then(serde_json::Value::as_str) else {
+            return false;
+        };
+        let words = Self::settings_title_words(title);
+        let identifies_touchpad = words
+            .iter()
+            .any(|word| matches!(word.as_str(), "touchpad" | "trackpad"));
+        let identifies_side = words
+            .iter()
+            .any(|word| matches!(word.as_str(), "left" | "right"));
+
+        identifies_touchpad && !identifies_side
+    }
+
     pub(super) fn touchpad_setting_field(
         json: &serde_json::Value,
         qsid: u16,
@@ -330,15 +353,9 @@ impl EntropyApp {
         json.get("settings")
             .and_then(|value| value.as_array())?
             .iter()
-            .find(|tab| {
-                tab.get("name")
-                    .and_then(|value| value.as_str())
-                    .map(|name| name.to_ascii_lowercase().contains("touchpad"))
-                    .unwrap_or(false)
-            })?
-            .get("fields")
-            .and_then(|value| value.as_array())?
-            .iter()
+            .filter(|tab| Self::is_generic_touchpad_settings_tab(tab))
+            .filter_map(|tab| tab.get("fields").and_then(|value| value.as_array()))
+            .flatten()
             .find(|field| field.get("qsid").and_then(|value| value.as_u64()) == Some(qsid as u64))
     }
 
@@ -361,31 +378,9 @@ impl EntropyApp {
     }
 
     pub(super) fn layout_json_has_touchpad_settings(json: &serde_json::Value) -> bool {
-        let Some(tabs) = json.get("settings").and_then(|value| value.as_array()) else {
-            return false;
-        };
-
-        tabs.iter().any(|tab| {
-            let tab_name = tab
-                .get("name")
-                .and_then(|value| value.as_str())
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            let has_touchpad_name = tab_name.contains("touchpad");
-            let has_touchpad_qsids = tab
-                .get("fields")
-                .and_then(|value| value.as_array())
-                .map(|fields| {
-                    [120u64, 121, 122, 123, 124].iter().all(|qsid| {
-                        fields.iter().any(|field| {
-                            field.get("qsid").and_then(|value| value.as_u64()) == Some(*qsid)
-                        })
-                    })
-                })
-                .unwrap_or(false);
-
-            has_touchpad_name && has_touchpad_qsids
-        })
+        [120u16, 121, 122, 123, 124]
+            .iter()
+            .all(|qsid| Self::touchpad_setting_exists(json, *qsid))
     }
 
     fn bluetooth_setting_variants(field: &serde_json::Value) -> Vec<String> {
@@ -808,7 +803,7 @@ impl EntropyApp {
         field: &serde_json::Value,
         supported_qmk_settings: &[u16],
     ) -> Option<ModuleSettingField> {
-        let qsid = field.get("qsid")?.as_u64()? as u16;
+        let qsid = u16::try_from(field.get("qsid")?.as_u64()?).ok()?;
         if !supported_qmk_settings.contains(&qsid) {
             return None;
         }
@@ -868,23 +863,103 @@ impl EntropyApp {
         })
     }
 
-    fn module_settings_group_kind(tab_name: &str) -> ModuleSettingsGroupKind {
-        let name = tab_name.to_ascii_lowercase();
-        if name.contains("left") {
-            ModuleSettingsGroupKind::Left
-        } else if name.contains("right") {
-            ModuleSettingsGroupKind::Right
-        } else if name.contains("auto") && name.contains("layer") {
-            ModuleSettingsGroupKind::AutoLayer
-        } else {
-            ModuleSettingsGroupKind::Other
+    fn module_setting_widths(fields: &[ModuleSettingField]) -> std::collections::BTreeMap<u16, u8> {
+        let mut widths = std::collections::BTreeMap::<u16, u8>::new();
+        for field in fields {
+            widths
+                .entry(field.qsid)
+                .and_modify(|width| *width = (*width).max(field.width))
+                .or_insert(field.width);
+        }
+        widths
+    }
+
+    fn module_settings_kind_from_words(words: &[String]) -> Option<ModuleSettingsGroupKind> {
+        match words.first().map(String::as_str) {
+            Some("left") => Some(ModuleSettingsGroupKind::Left),
+            Some("right") => Some(ModuleSettingsGroupKind::Right),
+            _ if words
+                .windows(2)
+                .any(|pair| pair[0] == "auto" && pair[1] == "layer") =>
+            {
+                Some(ModuleSettingsGroupKind::AutoLayer)
+            }
+            _ => None,
         }
     }
 
-    fn is_module_settings_tab(normalized_title: &str) -> bool {
-        normalized_title.contains("module")
-            || normalized_title.contains("trackball")
-            || (normalized_title.contains("auto") && normalized_title.contains("layer"))
+    fn module_settings_metadata_kind(value: &serde_json::Value) -> Option<ModuleSettingsGroupKind> {
+        ["side", "module_side", "moduleSide"]
+            .iter()
+            .filter_map(|key| value.get(key).and_then(serde_json::Value::as_str))
+            .find_map(|side| {
+                Self::module_settings_kind_from_words(&Self::settings_title_words(side))
+            })
+    }
+
+    fn is_module_settings_title(title: &str) -> bool {
+        let words = Self::settings_title_words(title);
+        let identifies_side = words
+            .iter()
+            .any(|word| matches!(word.as_str(), "left" | "right"));
+        let identifies_controller = words.iter().any(|word| {
+            matches!(
+                word.as_str(),
+                "controller" | "pointing" | "touchpad" | "trackpad"
+            )
+        });
+
+        words
+            .iter()
+            .any(|word| matches!(word.as_str(), "module" | "modules" | "trackball"))
+            || words
+                .windows(2)
+                .any(|pair| pair[0] == "auto" && pair[1] == "layer")
+            || (identifies_side && identifies_controller)
+    }
+
+    fn is_module_setting_field_title(title: &str) -> bool {
+        let words = Self::settings_title_words(title);
+        if Self::module_settings_kind_from_words(&words).is_none() {
+            return false;
+        }
+
+        words.iter().skip(1).any(|word| {
+            matches!(
+                word.as_str(),
+                "module"
+                    | "modules"
+                    | "trackball"
+                    | "ball"
+                    | "touchpad"
+                    | "scroll"
+                    | "pointer"
+                    | "pointing"
+                    | "mode"
+                    | "cpi"
+                    | "dpi"
+                    | "acceleration"
+                    | "layer"
+            )
+        })
+    }
+
+    fn module_settings_group_title(
+        tab_title: &str,
+        tab_kind: Option<ModuleSettingsGroupKind>,
+        group_kind: ModuleSettingsGroupKind,
+    ) -> String {
+        if tab_kind == Some(group_kind) || group_kind == ModuleSettingsGroupKind::Other {
+            return tab_title.to_string();
+        }
+
+        let prefix = match group_kind {
+            ModuleSettingsGroupKind::Left => "Left",
+            ModuleSettingsGroupKind::Right => "Right",
+            ModuleSettingsGroupKind::AutoLayer => "Auto Layer",
+            ModuleSettingsGroupKind::Other => unreachable!(),
+        };
+        format!("{prefix} {tab_title}")
     }
 
     pub(super) fn module_settings_groups(
@@ -895,40 +970,101 @@ impl EntropyApp {
             return Vec::new();
         };
 
-        let mut groups = tabs
-            .iter()
-            .filter_map(|tab| {
-                let title = tab.get("name")?.as_str()?.trim().to_string();
-                let normalized_title = title.to_ascii_lowercase();
-                if !Self::is_module_settings_tab(&normalized_title) {
-                    return None;
-                }
-                let fields = tab
-                    .get("fields")
-                    .and_then(|value| value.as_array())?
-                    .iter()
-                    .filter_map(|field| {
-                        Self::parse_module_setting_field(field, supported_qmk_settings)
-                    })
-                    .collect::<Vec<_>>();
-                if fields.is_empty() {
-                    return None;
-                }
-                Some(ModuleSettingsGroup {
-                    kind: Self::module_settings_group_kind(&title),
-                    title,
-                    fields,
-                })
-            })
-            .collect::<Vec<_>>();
+        let mut groups = Vec::new();
+        for tab in tabs {
+            let Some(title) = tab
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|title| !title.is_empty())
+            else {
+                continue;
+            };
+            let tab_metadata_kind = Self::module_settings_metadata_kind(tab);
+            let tab_kind = tab_metadata_kind.or_else(|| {
+                Self::module_settings_kind_from_words(&Self::settings_title_words(title))
+            });
+            let title_identifies_modules = Self::is_module_settings_title(title);
+            let Some(raw_fields) = tab.get("fields").and_then(serde_json::Value::as_array) else {
+                continue;
+            };
 
-        groups.sort_by_key(|group| match group.kind {
+            let parsed_fields = raw_fields
+                .iter()
+                .filter_map(|raw_field| {
+                    let field =
+                        Self::parse_module_setting_field(raw_field, supported_qmk_settings)?;
+                    let metadata_kind = Self::module_settings_metadata_kind(raw_field);
+                    let title_kind = Self::module_settings_kind_from_words(
+                        &Self::settings_title_words(&field.title),
+                    );
+                    let identifies_modules = metadata_kind.is_some()
+                        || Self::is_module_setting_field_title(&field.title);
+                    Some((field, metadata_kind.or(title_kind), identifies_modules))
+                })
+                .collect::<Vec<_>>();
+            if parsed_fields.is_empty()
+                || (!title_identifies_modules
+                    && tab_metadata_kind.is_none()
+                    && !parsed_fields
+                        .iter()
+                        .any(|(_, _, identifies_modules)| *identifies_modules))
+            {
+                continue;
+            }
+
+            let mut partitioned = Vec::<(ModuleSettingsGroupKind, Vec<ModuleSettingField>)>::new();
+            for (field, field_kind, _) in parsed_fields {
+                let kind = field_kind
+                    .or(tab_kind)
+                    .unwrap_or(ModuleSettingsGroupKind::Other);
+                if let Some((_, fields)) = partitioned
+                    .iter_mut()
+                    .find(|(existing_kind, _)| *existing_kind == kind)
+                {
+                    fields.push(field);
+                } else {
+                    partitioned.push((kind, vec![field]));
+                }
+            }
+
+            groups.extend(
+                partitioned
+                    .into_iter()
+                    .map(|(kind, fields)| ModuleSettingsGroup {
+                        title: Self::module_settings_group_title(title, tab_kind, kind),
+                        kind,
+                        fields,
+                    }),
+            );
+        }
+
+        let mut coalesced_side_groups = Vec::<ModuleSettingsGroup>::new();
+        for group in groups {
+            if matches!(
+                group.kind,
+                ModuleSettingsGroupKind::Left
+                    | ModuleSettingsGroupKind::Right
+                    | ModuleSettingsGroupKind::AutoLayer
+            ) {
+                if let Some(existing) = coalesced_side_groups
+                    .iter_mut()
+                    .find(|existing| existing.kind == group.kind)
+                {
+                    existing.fields.extend(group.fields);
+                    continue;
+                }
+            }
+            coalesced_side_groups.push(group);
+        }
+
+        coalesced_side_groups.sort_by_key(|group| match group.kind {
             ModuleSettingsGroupKind::Left => 0,
             ModuleSettingsGroupKind::Right => 1,
             ModuleSettingsGroupKind::AutoLayer => 2,
             ModuleSettingsGroupKind::Other => 3,
         });
-        groups
+        coalesced_side_groups
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -953,14 +1089,7 @@ impl EntropyApp {
             values: std::collections::BTreeMap::new(),
             supported: true,
         };
-        let mut widths = std::collections::BTreeMap::<u16, u8>::new();
-        for field in &settings.fields {
-            widths
-                .entry(field.qsid)
-                .and_modify(|width| *width = (*width).max(field.width))
-                .or_insert(field.width);
-        }
-        for (qsid, width) in widths {
+        for (qsid, width) in Self::module_setting_widths(&settings.fields) {
             let value = if width > 1 {
                 dev_conn.get_qmk_setting_u16(qsid)
             } else {
@@ -1242,6 +1371,334 @@ mod tests {
         assert_eq!(groups[0].fields[0].kind, ModuleSettingKind::Integer);
     }
 
+    #[test]
+    fn generic_touchpad_settings_can_span_multiple_tabs() {
+        let json = serde_json::json!({
+            "settings": [
+                {
+                    "name": "Touchpad Pointer",
+                    "fields": [
+                        {
+                            "title": "DPI",
+                            "qsid": 120,
+                            "type": "select",
+                            "variants": ["400", "800"]
+                        },
+                        { "title": "Sniper sensitivity", "qsid": 121, "type": "integer" }
+                    ]
+                },
+                {
+                    "name": "Touchpad Behavior",
+                    "fields": [
+                        { "title": "Scroll sensitivity", "qsid": 122, "type": "integer" },
+                        { "title": "Text sensitivity", "qsid": 123, "type": "integer" },
+                        { "title": "Options", "qsid": 124, "type": "integer" }
+                    ]
+                }
+            ]
+        });
+
+        assert!(EntropyApp::layout_json_has_touchpad_settings(&json));
+        assert_eq!(
+            EntropyApp::touchpad_setting_variants(&json, 120),
+            vec!["400", "800"]
+        );
+        assert_eq!(
+            EntropyApp::touchpad_setting_field(&json, 123)
+                .and_then(|field| field.get("title"))
+                .and_then(serde_json::Value::as_str),
+            Some("Text sensitivity")
+        );
+        assert!(EntropyApp::module_settings_groups(&json, &[120, 121, 122, 123, 124]).is_empty());
+    }
+
+    #[test]
+    fn generic_touchpad_settings_ignore_side_specific_tabs() {
+        let json = serde_json::json!({
+            "settings": [
+                {
+                    "name": "Left Touchpad",
+                    "fields": [
+                        { "title": "Ball DPI", "qsid": 120, "type": "select" },
+                        { "title": "Touch DPI", "qsid": 122, "type": "select" },
+                        { "title": "Scroll sensitivity", "qsid": 124, "type": "integer" }
+                    ]
+                },
+                {
+                    "name": "Right Touchpad",
+                    "fields": [
+                        { "title": "Ball DPI", "qsid": 121, "type": "select" },
+                        { "title": "Touch DPI", "qsid": 123, "type": "select" }
+                    ]
+                }
+            ]
+        });
+
+        assert!(!EntropyApp::layout_json_has_touchpad_settings(&json));
+        assert!(EntropyApp::touchpad_setting_field(&json, 120).is_none());
+    }
+
+    #[test]
+    fn module_settings_groups_include_split_touchpad_controller_tabs() {
+        let json = serde_json::json!({
+            "settings": [
+                {
+                    "name": "Left Touchpad",
+                    "fields": [
+                        {
+                            "title": "Mode",
+                            "qsid": 134,
+                            "type": "select",
+                            "variants": ["Normal", "Scroll"]
+                        },
+                        {
+                            "title": "Scroll sensitivity",
+                            "qsid": 125,
+                            "type": "integer",
+                            "min": 1,
+                            "max": 255
+                        }
+                    ]
+                },
+                {
+                    "name": "Right Controller",
+                    "fields": [
+                        {
+                            "title": "Mode",
+                            "qsid": 135,
+                            "type": "select",
+                            "variants": ["Normal", "Scroll"]
+                        },
+                        {
+                            "title": "Scroll sensitivity",
+                            "qsid": 128,
+                            "type": "integer",
+                            "min": 1,
+                            "max": 255
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let groups = EntropyApp::module_settings_groups(&json, &[125, 128, 134, 135]);
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].title, "Left Touchpad");
+        assert_eq!(groups[0].kind, ModuleSettingsGroupKind::Left);
+        assert_eq!(
+            groups[0]
+                .fields
+                .iter()
+                .map(|field| field.qsid)
+                .collect::<Vec<_>>(),
+            vec![134, 125]
+        );
+        assert_eq!(groups[1].title, "Right Controller");
+        assert_eq!(groups[1].kind, ModuleSettingsGroupKind::Right);
+        assert_eq!(
+            groups[1]
+                .fields
+                .iter()
+                .map(|field| field.qsid)
+                .collect::<Vec<_>>(),
+            vec![135, 128]
+        );
+    }
+
+    #[test]
+    fn module_settings_groups_keep_known_split_controller_tabs() {
+        let json = serde_json::json!({
+            "settings": [
+                {
+                    "name": "Left Modules",
+                    "fields": [module_select_field("Left Mode", 120)]
+                },
+                {
+                    "name": "Right Modules",
+                    "fields": [module_select_field("Right Mode", 121)]
+                },
+                {
+                    "name": "Auto Layer",
+                    "fields": [module_select_field("Timeout", 122)]
+                }
+            ]
+        });
+
+        let groups = EntropyApp::module_settings_groups(&json, &[120, 121, 122]);
+
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[0].title, "Left Modules");
+        assert_eq!(groups[0].kind, ModuleSettingsGroupKind::Left);
+        assert_eq!(groups[0].fields[0].title, "Left Mode");
+        assert_eq!(groups[1].title, "Right Modules");
+        assert_eq!(groups[1].kind, ModuleSettingsGroupKind::Right);
+        assert_eq!(groups[1].fields[0].title, "Right Mode");
+        assert_eq!(groups[2].kind, ModuleSettingsGroupKind::AutoLayer);
+    }
+
+    #[test]
+    fn module_settings_groups_coalesce_kinds_across_tabs() {
+        let json = serde_json::json!({
+            "settings": [
+                {
+                    "name": "Left Modules",
+                    "fields": [module_select_field("Left Mode", 120)]
+                },
+                {
+                    "name": "Right Modules",
+                    "fields": [module_select_field("Right Mode", 121)]
+                },
+                {
+                    "name": "Auto Layer",
+                    "fields": [module_select_field("Timeout", 122)]
+                },
+                {
+                    "name": "Controller Settings",
+                    "fields": [
+                        module_select_field("Left Scroll Sens", 123),
+                        module_select_field("Right Scroll Sens", 124),
+                        module_select_field("Auto Layer Timeout", 125)
+                    ]
+                }
+            ]
+        });
+
+        let groups = EntropyApp::module_settings_groups(&json, &[120, 121, 122, 123, 124, 125]);
+
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[0].kind, ModuleSettingsGroupKind::Left);
+        assert_eq!(
+            groups[0]
+                .fields
+                .iter()
+                .map(|field| field.qsid)
+                .collect::<Vec<_>>(),
+            vec![120, 123]
+        );
+        assert_eq!(groups[1].kind, ModuleSettingsGroupKind::Right);
+        assert_eq!(
+            groups[1]
+                .fields
+                .iter()
+                .map(|field| field.qsid)
+                .collect::<Vec<_>>(),
+            vec![121, 124]
+        );
+        assert_eq!(groups[2].kind, ModuleSettingsGroupKind::AutoLayer);
+        assert_eq!(
+            groups[2]
+                .fields
+                .iter()
+                .map(|field| field.qsid)
+                .collect::<Vec<_>>(),
+            vec![122, 125]
+        );
+        let mut state = ModuleSettingsState {
+            groups,
+            selected_module_group: 0,
+            ..Default::default()
+        };
+        assert_eq!(state.selected_module_group(), Some(0));
+        state.set_selected_module_group(1);
+        assert_eq!(state.selected_module_group(), Some(1));
+    }
+
+    #[test]
+    fn module_settings_groups_split_mixed_controller_tabs() {
+        let json = serde_json::json!({
+            "settings": [{
+                "name": "Modules",
+                "fields": [
+                    module_select_field("Left Mode", 120),
+                    module_select_field("Right Mode", 121),
+                    module_select_field("Shared Resolution", 122)
+                ]
+            }]
+        });
+
+        let groups = EntropyApp::module_settings_groups(&json, &[120, 121, 122]);
+
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[0].title, "Left Modules");
+        assert_eq!(groups[0].kind, ModuleSettingsGroupKind::Left);
+        assert_eq!(groups[0].fields[0].title, "Left Mode");
+        assert_eq!(groups[1].title, "Right Modules");
+        assert_eq!(groups[1].kind, ModuleSettingsGroupKind::Right);
+        assert_eq!(groups[1].fields[0].title, "Right Mode");
+        assert_eq!(groups[2].title, "Modules");
+        assert_eq!(groups[2].kind, ModuleSettingsGroupKind::Other);
+        assert_eq!(groups[2].fields[0].title, "Shared Resolution");
+    }
+
+    #[test]
+    fn module_settings_groups_prefer_explicit_side_metadata() {
+        let json = serde_json::json!({
+            "settings": [{
+                "name": "Controller Settings",
+                "fields": [
+                    module_select_field("Mode", 120).with_value("side", "left"),
+                    module_select_field("Mode", 121).with_value("module_side", "right")
+                ]
+            }]
+        });
+
+        let groups = EntropyApp::module_settings_groups(&json, &[120, 121]);
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].title, "Left Controller Settings");
+        assert_eq!(groups[0].kind, ModuleSettingsGroupKind::Left);
+        assert_eq!(groups[1].title, "Right Controller Settings");
+        assert_eq!(groups[1].kind, ModuleSettingsGroupKind::Right);
+    }
+
+    #[test]
+    fn module_settings_groups_do_not_match_side_name_substrings() {
+        let json = serde_json::json!({
+            "settings": [
+                {
+                    "name": "Brightness Modules",
+                    "fields": [module_select_field("Brightness", 120)]
+                },
+                {
+                    "name": "Modulator",
+                    "fields": [module_select_field("Left Shift", 121)]
+                },
+                {
+                    "name": "Left Keyboard",
+                    "fields": [module_select_field("Layout", 122)]
+                }
+            ]
+        });
+
+        let groups = EntropyApp::module_settings_groups(&json, &[120, 121, 122]);
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].title, "Brightness Modules");
+        assert_eq!(groups[0].kind, ModuleSettingsGroupKind::Other);
+        assert_eq!(groups[0].fields[0].qsid, 120);
+    }
+
+    trait JsonValueExt {
+        fn with_value(self, key: &str, value: &str) -> serde_json::Value;
+    }
+
+    impl JsonValueExt for serde_json::Value {
+        fn with_value(mut self, key: &str, value: &str) -> serde_json::Value {
+            self[key] = serde_json::Value::String(value.to_string());
+            self
+        }
+    }
+
+    fn module_select_field(title: &str, qsid: u16) -> serde_json::Value {
+        serde_json::json!({
+            "title": title,
+            "qsid": qsid,
+            "type": "select",
+            "variants": ["Normal", "Scrolling"]
+        })
+    }
+
     fn test_module_field(title: &str, qsid: u16) -> ModuleSettingField {
         ModuleSettingField {
             title: title.to_string(),
@@ -1348,5 +1805,118 @@ mod tests {
         assert!(EntropyApp::module_settings_encoder_visible(
             &settings, &layout, 0
         ));
+    }
+
+    #[test]
+    fn module_setting_parser_preserves_integer_width_and_bounds() {
+        let field = EntropyApp::parse_module_setting_field(
+            &serde_json::json!({
+                "title": " Ball DPI ",
+                "qsid": 120,
+                "type": "integer",
+                "width": 2,
+                "min": 100,
+                "max": 16000
+            }),
+            &[120],
+        )
+        .expect("supported integer field should parse");
+
+        assert_eq!(field.title, "Ball DPI");
+        assert_eq!(field.qsid, 120);
+        assert_eq!(field.kind, ModuleSettingKind::Integer);
+        assert_eq!(field.width, 2);
+        assert_eq!(field.min, 100);
+        assert_eq!(field.max, 16000);
+    }
+
+    #[test]
+    fn module_setting_parser_normalizes_select_metadata() {
+        let field = EntropyApp::parse_module_setting_field(
+            &serde_json::json!({
+                "title": "Mode",
+                "qsid": 134,
+                "type": "select",
+                "width": 0,
+                "bit": 99,
+                "variants": ["Normal", " Scroll ", ""]
+            }),
+            &[134],
+        )
+        .expect("supported select field should parse");
+
+        assert_eq!(field.kind, ModuleSettingKind::Select);
+        assert_eq!(field.width, 1);
+        assert_eq!(field.bit, 15);
+        assert_eq!(field.variants, vec!["Normal", "Scroll"]);
+        assert_eq!(field.min, 0);
+        assert_eq!(field.max, 1);
+    }
+
+    #[test]
+    fn module_setting_parser_rejects_unsupported_or_invalid_fields() {
+        let unsupported = serde_json::json!({
+            "title": "Mode",
+            "qsid": 134,
+            "type": "select"
+        });
+        let overflowed_qsid = serde_json::json!({
+            "title": "Mode",
+            "qsid": 65536,
+            "type": "select"
+        });
+        let blank_title = serde_json::json!({
+            "title": "  ",
+            "qsid": 134,
+            "type": "select"
+        });
+        let unknown_type = serde_json::json!({
+            "title": "Mode",
+            "qsid": 134,
+            "type": "slider"
+        });
+
+        assert!(EntropyApp::parse_module_setting_field(&unsupported, &[]).is_none());
+        assert!(EntropyApp::parse_module_setting_field(&overflowed_qsid, &[0]).is_none());
+        assert!(EntropyApp::parse_module_setting_field(&blank_title, &[134]).is_none());
+        assert!(EntropyApp::parse_module_setting_field(&unknown_type, &[134]).is_none());
+    }
+
+    #[test]
+    fn duplicate_module_qsid_uses_widest_read_width() {
+        let narrow = EntropyApp::parse_module_setting_field(
+            &serde_json::json!({
+                "title": "Mode",
+                "qsid": 134,
+                "type": "select",
+                "width": 1
+            }),
+            &[134, 135],
+        )
+        .unwrap();
+        let wide = EntropyApp::parse_module_setting_field(
+            &serde_json::json!({
+                "title": "Resolution",
+                "qsid": 134,
+                "type": "integer",
+                "width": 2
+            }),
+            &[134, 135],
+        )
+        .unwrap();
+        let other = EntropyApp::parse_module_setting_field(
+            &serde_json::json!({
+                "title": "Invert",
+                "qsid": 135,
+                "type": "boolean"
+            }),
+            &[134, 135],
+        )
+        .unwrap();
+
+        assert_eq!(
+            EntropyApp::module_setting_widths(&[narrow, wide, other]),
+            std::collections::BTreeMap::from([(134, 2), (135, 1)])
+        );
     }
 }

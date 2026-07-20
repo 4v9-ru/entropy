@@ -30,6 +30,10 @@ use app_storage::*;
 #[path = "app_update.rs"]
 mod app_update;
 use app_update::*;
+#[path = "app_repaint.rs"]
+mod app_repaint;
+#[cfg(not(target_arch = "wasm32"))]
+use app_repaint::*;
 #[path = "entlayout.rs"]
 mod entlayout;
 #[path = "entsettings.rs"]
@@ -56,6 +60,10 @@ mod app_settings_ui;
 mod auto_shift_settings_ui;
 #[path = "ui/bluetooth_settings.rs"]
 mod bluetooth_settings_ui;
+#[path = "ui/combo_write.rs"]
+mod combo_write;
+#[cfg(not(target_arch = "wasm32"))]
+use combo_write::ComboWriteTask;
 #[path = "ui/combo_settings.rs"]
 mod combo_settings_ui;
 #[path = "ui/device_connect_apply.rs"]
@@ -135,6 +143,11 @@ mod onboarding_tour;
 mod rgb_settings_ui;
 #[path = "ui/settings_shell.rs"]
 mod settings_shell;
+#[path = "ui/settings_write_queue.rs"]
+mod settings_write_queue;
+use settings_write_queue::SettingsWriteQueueState;
+#[cfg(not(target_arch = "wasm32"))]
+use settings_write_queue::SettingsWriteTask;
 #[path = "ui/tap_hold_settings.rs"]
 mod tap_hold_settings_ui;
 #[path = "ui/text_expander_editor.rs"]

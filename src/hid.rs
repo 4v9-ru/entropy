@@ -133,6 +133,29 @@ pub struct HidDevice {
     backend: HidBackend,
 }
 
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct TestHidRecorder {
+    requests: std::sync::Arc<std::sync::Mutex<Vec<[u8; MSG_LEN]>>>,
+}
+
+#[cfg(test)]
+impl TestHidRecorder {
+    pub(crate) fn requests(&self) -> Vec<[u8; MSG_LEN]> {
+        self.requests
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) enum TestHidFault {
+    Disconnect,
+    WorkerPanic,
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 enum HidBackend {
     Local {
@@ -142,6 +165,13 @@ enum HidBackend {
     },
     #[cfg(target_os = "windows")]
     Proxy(HidProxy),
+    #[cfg(test)]
+    Test {
+        recorder: TestHidRecorder,
+        combo: std::sync::Mutex<([u16; 4], u16)>,
+        qmk_settings: std::sync::Mutex<std::collections::BTreeMap<u16, u16>>,
+        fault_after_requests: std::sync::Mutex<Option<(usize, TestHidFault)>>,
+    },
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -165,6 +195,8 @@ impl HidDevice {
             HidBackend::Local { transport, .. } => transport.is_bluetooth(),
             #[cfg(target_os = "windows")]
             HidBackend::Proxy(proxy) => proxy.is_bluetooth_transport(),
+            #[cfg(test)]
+            HidBackend::Test { .. } => false,
         }
     }
 }
@@ -250,6 +282,29 @@ fn device_info_matches(
 
 #[cfg(not(target_arch = "wasm32"))]
 impl HidDevice {
+    #[cfg(test)]
+    pub(crate) fn test_device() -> (Self, TestHidRecorder) {
+        Self::test_device_with_fault_after_requests(None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_device_with_fault_after_requests(
+        fault_after_requests: Option<(usize, TestHidFault)>,
+    ) -> (Self, TestHidRecorder) {
+        let recorder = TestHidRecorder {
+            requests: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let device = Self {
+            backend: HidBackend::Test {
+                recorder: recorder.clone(),
+                combo: std::sync::Mutex::new(([0; 4], 0)),
+                qmk_settings: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+                fault_after_requests: std::sync::Mutex::new(fault_after_requests),
+            },
+        };
+        (device, recorder)
+    }
+
     pub fn open(path: &str) -> Result<Self> {
         #[cfg(target_os = "macos")]
         let _hid_lock = macos_hid_operation_lock();
@@ -424,6 +479,84 @@ impl HidDevice {
             } => usb_send_local(device, *transport, path.as_deref(), data),
             #[cfg(target_os = "windows")]
             HidBackend::Proxy(proxy) => proxy.usb_send(data),
+            #[cfg(test)]
+            HidBackend::Test {
+                recorder,
+                combo,
+                qmk_settings,
+                fault_after_requests,
+            } => {
+                let mut request = [0; MSG_LEN];
+                let len = data.len().min(MSG_LEN);
+                request[..len].copy_from_slice(&data[..len]);
+                recorder
+                    .requests
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .push(request);
+
+                let fault = {
+                    let mut pending = fault_after_requests
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    match pending.as_mut() {
+                        Some((remaining, _)) if *remaining == 0 => pending.take(),
+                        Some((remaining, _)) => {
+                            *remaining -= 1;
+                            None
+                        }
+                        None => None,
+                    }
+                };
+                if let Some((_, fault)) = fault {
+                    match fault {
+                        TestHidFault::Disconnect => bail!("HID device disconnected"),
+                        TestHidFault::WorkerPanic => panic!("test HID worker stopped"),
+                    }
+                }
+
+                let mut response = [0; MSG_LEN];
+                match (request[0], request[1], request[2]) {
+                    (CMD_VIA_VIAL_PREFIX, CMD_VIAL_DYNAMIC_ENTRY_OP, DYNAMIC_VIAL_COMBO_SET) => {
+                        let mut keys = [0; 4];
+                        for (index, key) in keys.iter_mut().enumerate() {
+                            let offset = 4 + index * 2;
+                            *key = u16::from_le_bytes([request[offset], request[offset + 1]]);
+                        }
+                        let output = u16::from_le_bytes([request[12], request[13]]);
+                        *combo.lock().unwrap_or_else(|error| error.into_inner()) = (keys, output);
+                    }
+                    (CMD_VIA_VIAL_PREFIX, CMD_VIAL_DYNAMIC_ENTRY_OP, DYNAMIC_VIAL_COMBO_GET) => {
+                        let (keys, output) =
+                            *combo.lock().unwrap_or_else(|error| error.into_inner());
+                        for (index, key) in keys.iter().enumerate() {
+                            let offset = 1 + index * 2;
+                            response[offset..offset + 2].copy_from_slice(&key.to_le_bytes());
+                        }
+                        response[9..11].copy_from_slice(&output.to_le_bytes());
+                    }
+                    (CMD_VIA_VIAL_PREFIX, CMD_VIAL_QMK_SETTINGS_SET, _) => {
+                        let qsid = u16::from_le_bytes([request[2], request[3]]);
+                        let value = u16::from_le_bytes([request[4], request[5]]);
+                        qmk_settings
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .insert(qsid, value);
+                    }
+                    (CMD_VIA_VIAL_PREFIX, CMD_VIAL_QMK_SETTINGS_GET, _) => {
+                        let qsid = u16::from_le_bytes([request[2], request[3]]);
+                        let value = qmk_settings
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .get(&qsid)
+                            .copied()
+                            .unwrap_or_default();
+                        response[1..3].copy_from_slice(&value.to_le_bytes());
+                    }
+                    _ => {}
+                }
+                Ok(response)
+            }
         }
     }
 }
@@ -588,12 +721,12 @@ fn read_response(
             resp.copy_from_slice(&read_buf[..MSG_LEN]);
         }
 
-        if !transport.is_bluetooth() || response_matches_command(command, &resp) {
+        if response_matches_command(command, &resp) {
             return Ok(resp);
         }
 
         last_error = Some(anyhow::anyhow!(
-            "HID stale or unrelated BLE report for command {:02X}: {:02X?}",
+            "HID stale or unrelated report for command {:02X}: {:02X?}",
             command.first().copied().unwrap_or(0),
             &resp[..command.len().clamp(3, 8)]
         ));
@@ -664,16 +797,49 @@ fn response_matches_vial_command(command: &[u8], resp: &[u8; MSG_LEN]) -> bool {
         }
         CMD_VIAL_GET_UNLOCK_STATUS => matches!(resp[0], 0 | 1) && matches!(resp[1], 0 | 1),
         CMD_VIAL_UNLOCK_POLL => matches!(resp[0], 0 | 1) && matches!(resp[1], 0 | 1),
-        CMD_VIAL_QMK_SETTINGS_GET
-        | CMD_VIAL_QMK_SETTINGS_SET
-        | CMD_VIAL_DYNAMIC_ENTRY_OP
+        CMD_VIAL_QMK_SETTINGS_QUERY => response_matches_qmk_settings_query(command, resp),
+        CMD_VIAL_QMK_SETTINGS_GET => response_matches_qmk_settings_get(command, resp),
+        CMD_VIAL_QMK_SETTINGS_SET => response_echoes_vial_command(command, resp),
+        CMD_VIAL_DYNAMIC_ENTRY_OP
         | CMD_VIAL_GET_ENCODER
         | CMD_VIAL_SET_ENCODER
-        | CMD_VIAL_QMK_SETTINGS_QUERY
         | CMD_VIAL_UNLOCK_START
         | CMD_VIAL_LOCK => true,
         _ => true,
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn response_echoes_vial_command(command: &[u8], resp: &[u8; MSG_LEN]) -> bool {
+    command.len() >= 2
+        && command.len() <= MSG_LEN
+        && resp[1..command.len()] == command[1..]
+        && resp[command.len()..].iter().all(|byte| *byte == 0)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn response_matches_qmk_settings_get(command: &[u8], resp: &[u8; MSG_LEN]) -> bool {
+    command.len() >= 4 && (resp[0] == 0 || response_echoes_vial_command(command, resp))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn response_matches_qmk_settings_query(command: &[u8], resp: &[u8; MSG_LEN]) -> bool {
+    let Some(qsid_bytes) = command.get(2..4) else {
+        return false;
+    };
+    let cursor = u16::from_le_bytes([qsid_bytes[0], qsid_bytes[1]]);
+    let mut reached_terminator = false;
+
+    for chunk in resp.chunks_exact(2) {
+        let qsid = u16::from_le_bytes([chunk[0], chunk[1]]);
+        if qsid == u16::MAX {
+            reached_terminator = true;
+        } else if reached_terminator || qsid <= cursor {
+            return false;
+        }
+    }
+
+    true
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -874,5 +1040,102 @@ fn hex_nibble(byte: u8) -> Result<u8> {
         b'a'..=b'f' => Ok(byte - b'a' + 10),
         b'A'..=b'F' => Ok(byte - b'A' + 10),
         _ => bail!("invalid hex digit"),
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    fn qmk_settings_command(subcommand: u8, qsid: u16) -> [u8; MSG_LEN] {
+        let mut command = [0u8; MSG_LEN];
+        command[0] = CMD_VIA_VIAL_PREFIX;
+        command[1] = subcommand;
+        command[2..4].copy_from_slice(&qsid.to_le_bytes());
+        command
+    }
+
+    #[test]
+    fn qmk_settings_set_accepts_echoed_command_response() {
+        let mut command = qmk_settings_command(CMD_VIAL_QMK_SETTINGS_SET, 300);
+        command[4..6].copy_from_slice(&2048u16.to_le_bytes());
+        let mut response = command;
+        response[0] = 0;
+
+        assert!(response_matches_command(&command, &response));
+    }
+
+    #[test]
+    fn qmk_settings_set_rejects_stale_get_response() {
+        let mut command = qmk_settings_command(CMD_VIAL_QMK_SETTINGS_SET, 300);
+        command[4] = 2;
+        let mut stale_response = [0u8; MSG_LEN];
+        stale_response[0] = 0;
+        stale_response[1] = 2;
+        stale_response[2..4].copy_from_slice(&300u16.to_le_bytes());
+
+        assert!(!response_matches_command(&command, &stale_response));
+    }
+
+    #[test]
+    fn qmk_settings_set_rejects_echo_for_another_qsid() {
+        let command = qmk_settings_command(CMD_VIAL_QMK_SETTINGS_SET, 300);
+        let mut stale_response = qmk_settings_command(CMD_VIAL_QMK_SETTINGS_SET, 301);
+        stale_response[0] = 0;
+
+        assert!(!response_matches_command(&command, &stale_response));
+    }
+
+    #[test]
+    fn qmk_settings_get_accepts_success_and_echoed_error_shapes() {
+        let command = qmk_settings_command(CMD_VIAL_QMK_SETTINGS_GET, 300);
+        let mut success = [0u8; MSG_LEN];
+        success[0] = 0;
+        success[1..3].copy_from_slice(&2048u16.to_le_bytes());
+        let mut error = command;
+        error[0] = u8::MAX;
+
+        assert!(response_matches_command(&command, &success));
+        assert!(response_matches_command(&command, &error));
+    }
+
+    #[test]
+    fn qmk_settings_get_rejects_impossible_status_payload() {
+        let command = qmk_settings_command(CMD_VIAL_QMK_SETTINGS_GET, 300);
+        let mut response = [0u8; MSG_LEN];
+        response[0] = 0x7F;
+        response[1] = 0x42;
+
+        assert!(!response_matches_command(&command, &response));
+    }
+
+    #[test]
+    fn qmk_settings_query_accepts_advancing_qsids_and_terminator() {
+        let command = qmk_settings_command(CMD_VIAL_QMK_SETTINGS_QUERY, 100);
+        let mut response = [u8::MAX; MSG_LEN];
+        response[0..2].copy_from_slice(&101u16.to_le_bytes());
+        response[2..4].copy_from_slice(&300u16.to_le_bytes());
+
+        assert!(response_matches_command(&command, &response));
+    }
+
+    #[test]
+    fn qmk_settings_query_rejects_stale_nonadvancing_batch() {
+        let command = qmk_settings_command(CMD_VIAL_QMK_SETTINGS_QUERY, 300);
+        let mut stale_response = [u8::MAX; MSG_LEN];
+        stale_response[0..2].copy_from_slice(&101u16.to_le_bytes());
+        stale_response[2..4].copy_from_slice(&300u16.to_le_bytes());
+
+        assert!(!response_matches_command(&command, &stale_response));
+    }
+
+    #[test]
+    fn qmk_settings_query_rejects_values_after_terminator() {
+        let command = qmk_settings_command(CMD_VIAL_QMK_SETTINGS_QUERY, 100);
+        let mut response = [u8::MAX; MSG_LEN];
+        response[0..2].copy_from_slice(&101u16.to_le_bytes());
+        response[4..6].copy_from_slice(&300u16.to_le_bytes());
+
+        assert!(!response_matches_command(&command, &response));
     }
 }

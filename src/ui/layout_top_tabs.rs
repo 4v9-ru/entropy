@@ -84,7 +84,7 @@ impl EntropyApp {
         let tab_labels = tabs.map(|(_, label, _)| label);
         let undo_label = crate::i18n::tr_catalog(lang, "alt_repeat_editor.undo_curved");
         let undo_font = FontId::proportional(14.0);
-        let undo_text_w = ui.fonts(|f| {
+        let undo_text_w = ui.fonts_mut(|f| {
             f.layout_no_wrap(
                 undo_label.to_owned(),
                 undo_font.clone(),
@@ -205,7 +205,7 @@ impl EntropyApp {
         self.draw_ui_scale_controls(ui, zoom_left_top);
 
         #[cfg(not(target_arch = "wasm32"))]
-        let undo_enabled = !self.undo_stack.is_empty() && self.layer_write_task.is_none();
+        let undo_enabled = !self.undo_stack.is_empty() && !self.hid_write_task_active();
         #[cfg(target_arch = "wasm32")]
         let undo_enabled = !self.undo_stack.is_empty();
         let undo_resp = ui.allocate_rect(undo_rect, Sense::CLICK);
@@ -255,7 +255,7 @@ impl EntropyApp {
             let x = divider_x + tab_gap / 2.0;
             ui.painter().line_segment(
                 [egui::pos2(x, divider_top), egui::pos2(x, divider_bottom)],
-                egui::Stroke::new(1.5, divider_color),
+                egui::Stroke::new(1.5_f32, divider_color),
             );
             divider_x += tab_gap;
         }

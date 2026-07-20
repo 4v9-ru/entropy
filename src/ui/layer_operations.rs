@@ -562,12 +562,12 @@ impl EntropyApp {
             Sense::click(),
         );
         if button_response.clicked() {
-            ui.memory_mut(|memory| memory.toggle_popup(popup_id));
+            egui::Popup::toggle_id(ui.ctx(), popup_id);
         }
         if button_response.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
-        let popup_open = ui.memory(|memory| memory.is_popup_open(popup_id));
+        let popup_open = egui::Popup::is_id_open(ui.ctx(), popup_id);
         if button_response.hovered() || popup_open {
             ui.painter()
                 .rect_filled(button_rect, 8.0, app_hover_fill(self.dark_mode));
@@ -621,7 +621,7 @@ impl EntropyApp {
         ui.style_mut().visuals.window_stroke =
             crate::ui_style::modal_outline_stroke(self.dark_mode);
         ui.style_mut().visuals.window_fill = app_surface_fill(self.dark_mode);
-        egui::popup_below_widget(
+        crate::ui_style::popup_below_widget(
             ui,
             popup_id,
             &button_response,
@@ -705,7 +705,7 @@ impl EntropyApp {
                 }
 
                 if requested_action.is_some() {
-                    ui.memory_mut(|memory| memory.close_popup());
+                    egui::Popup::close_all(ui.ctx());
                 }
             },
         );
@@ -796,7 +796,7 @@ impl EntropyApp {
         action_key: &'static str,
         undo_behavior: LayerUndoBehavior,
     ) {
-        if self.layer_write_task.is_some() {
+        if self.hid_write_task_active() {
             if let LayerUndoBehavior::RetryDesired { requires_firmware } = undo_behavior {
                 self.undo_stack.push(UndoAction::Layer {
                     layer,
@@ -986,6 +986,7 @@ impl EntropyApp {
             Ok(result) => {
                 self.layer_write_task = None;
                 self.finish_layer_write(result);
+                self.continue_pending_settings_writes(ctx);
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
                 ctx.request_repaint_after(std::time::Duration::from_millis(16));
@@ -1013,6 +1014,7 @@ impl EntropyApp {
                         ("layer", &task.fallback.layer.to_string()),
                     ],
                 );
+                self.continue_pending_settings_writes(ctx);
             }
         }
     }

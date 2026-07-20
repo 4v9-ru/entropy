@@ -10,6 +10,54 @@ fn should_keep_vial_unlock_visible(unlock_open: bool, unlock_polling: bool) -> b
 }
 
 impl EntropyApp {
+    #[cfg(not(target_arch = "wasm32"))]
+    fn deferred_exit_has_pending_hid_writes(&self) -> bool {
+        self.keycode_picker.macros_dirty
+            || self.combo_dirty
+            || self.combo_term_dirty
+            || self.keycode_picker.tap_dance_dirty
+            || self.key_override_dirty
+            || !self.pending_tap_hold_numeric_writes.is_empty()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn defer_exit_until_hid_write_returns(&mut self, ctx: &egui::Context) -> bool {
+        if !self.hid_write_task_active() {
+            return false;
+        }
+
+        self.exit_after_hid_write = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        true
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn finish_deferred_exit_after_hid_write(&mut self, ctx: &egui::Context) {
+        if !self.exit_after_hid_write || self.hid_write_task_active() {
+            return;
+        }
+
+        // Keep unsaved state and its failure status for a later retry, but do
+        // not block close forever when no transport remains to drain it.
+        if self.hid_device.is_none() {
+            self.exit_after_hid_write = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+
+        self.flush_pending_tap_hold_numeric_writes();
+        self.fallback_entropy_display_presets_before_exit();
+
+        if self.deferred_exit_has_pending_hid_writes() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            return;
+        }
+
+        self.exit_after_hid_write = false;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
     fn keep_vial_unlock_visible(&mut self, ctx: &egui::Context) {
         self.restore_from_tray(ctx);
         self.status_msg = crate::i18n::tr_catalog(
@@ -130,10 +178,18 @@ impl EntropyApp {
 
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         if self.consume_tray_quit_request() {
+            #[cfg(not(target_arch = "wasm32"))]
+            if self.defer_exit_until_hid_write_returns(ctx) {
+                return;
+            }
             return;
         }
 
         if self.force_close_requested {
+            #[cfg(not(target_arch = "wasm32"))]
+            if self.defer_exit_until_hid_write_returns(ctx) {
+                return;
+            }
             return;
         }
 
@@ -155,7 +211,12 @@ impl EntropyApp {
                 self.close_to_tray_prompt_remember = false;
                 ctx.request_repaint();
             }
-            CloseToTrayBehavior::Ask | CloseToTrayBehavior::Close | CloseToTrayBehavior::Tray => {}
+            CloseToTrayBehavior::Ask | CloseToTrayBehavior::Close | CloseToTrayBehavior::Tray => {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    self.defer_exit_until_hid_write_returns(ctx);
+                }
+            }
         }
     }
 
@@ -225,8 +286,8 @@ impl EntropyApp {
             return;
         }
 
-        let dark = ctx.style().visuals.dark_mode;
-        let screen_rect = ctx.screen_rect();
+        let dark = ctx.global_style().visuals.dark_mode;
+        let screen_rect = ctx.content_rect();
         egui::Area::new("close_to_tray_prompt_backdrop".into())
             .order(egui::Order::Foreground)
             .fixed_pos(screen_rect.min)
@@ -305,7 +366,7 @@ impl EntropyApp {
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .fixed_size(panel_size)
             .frame(crate::ui_style::modal_window_frame(
-                ctx.style().as_ref(),
+                ctx.global_style().as_ref(),
                 dark,
             ))
             .show(ctx, |ui| {
@@ -364,7 +425,7 @@ impl EntropyApp {
                 let checkbox_size = 13.0;
                 let remember_gap = 7.0;
                 let remember_font = FontId::proportional(12.5);
-                let remember_text_width = ui.fonts(|f| {
+                let remember_text_width = ui.fonts_mut(|f| {
                     f.layout_no_wrap(
                         remember.to_owned(),
                         remember_font.clone(),

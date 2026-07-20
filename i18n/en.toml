@@ -420,6 +420,9 @@ unknown = "Unknown"
 [status_messages]
 macros_saved = "Macros saved"
 combos_saved = "Combos saved"
+combos_saving = "Saving combo…"
+combo_incomplete = "Combo C{index} not saved: choose 2–4 input keys and an output key"
+combo_write_task_stopped = "background save task stopped"
 combo_timeout_saved = "Combo timeout saved"
 imported_entlayout = "Imported .entlayout"
 layout_import_report_title = "Layout import report"
@@ -443,6 +446,10 @@ device_unlocked = "Device unlocked!"
 unlock_interrupted_disconnected = "Unlock interrupted — device disconnected or unavailable: {error}"
 unlock_poll_retry = "Unlock communication interrupted; retrying: {error}"
 finish_unlock_before_closing = "Finish device unlock or reconnect it before closing Entropy"
+refresh_device_data_pending_write = "Finish the pending layer write before refreshing device data"
+refresh_device_data_missing_device = "Failed to refresh device data: device not found"
+refresh_device_data_missing_info = "Failed to refresh device data: device information unavailable"
+refresh_device_data_delete_failed = "Failed to remove cached device data"
 
 [dynamic_status]
 device_not_found = "Device not found"
@@ -1145,6 +1152,18 @@ tap_this_many_times_to_keep_a_one_shot_key_held_until_tapped_again = "Tap this m
 one_shot_timeout = "One-shot timeout"
 how_long_one_shot_state_waits_before_it_is_released = "How long one-shot state waits before it is released"
 value_is_in_milliseconds = "Value is in milliseconds"
+
+[settings_write]
+pending = "Saving"
+saved = "Saved"
+failed = "Save failed: {error}"
+pending_status = "Saving {setting}..."
+saved_status = "Saved {setting}"
+failed_status = "Failed to save {setting}: {error}"
+device_not_connected = "Device is not connected"
+device_disconnected = "Device disconnected"
+worker_failed = "Settings write worker stopped unexpectedly"
+busy = "Wait for the pending setting to finish saving"
 
 [touchpad_settings]
 dpi = "DPI"
