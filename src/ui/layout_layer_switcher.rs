@@ -27,6 +27,11 @@ fn main_menu_battery_status(battery: Option<crate::hid::BatteryHalves>) -> MainM
     }
 }
 
+fn main_menu_reserves_battery_status_space(info: Option<&DeviceAboutInfo>) -> bool {
+    info.map(|info| info.supports_battery_halves)
+        .unwrap_or(false)
+}
+
 fn layer_after_wheel(selected: usize, layer_count: usize, wheel_delta: f32) -> usize {
     if layer_count == 0 {
         return 0;
@@ -49,8 +54,8 @@ impl EntropyApp {
         )
     }
 
-    pub(super) fn main_menu_has_battery_status(&self) -> bool {
-        self.main_menu_battery_status() != MainMenuBatteryStatus::None
+    pub(super) fn main_menu_reserves_battery_status_space(&self) -> bool {
+        main_menu_reserves_battery_status_space(self.device_about_info.as_ref())
     }
 
     fn draw_main_menu_battery_status(&self, ui: &mut egui::Ui, center_x: f32, layer_center_y: f32) {
@@ -297,15 +302,17 @@ impl EntropyApp {
                     self.selected_layer = selected + 1;
                     self.jump_back_stack.clear();
                 }
-                if name_r.hovered() {
+                #[cfg(not(target_arch = "wasm32"))]
+                let layer_name_edit_available = !self.hid_write_task_active();
+                #[cfg(target_arch = "wasm32")]
+                let layer_name_edit_available = true;
+                if name_r.hovered() && layer_name_edit_available {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                 }
-                if name_r.clicked() {
+                if name_r.clicked() && layer_name_edit_available {
                     self.editing_layer = Some(selected);
                     self.editing_layer_text = raw_name.clone();
                 }
-
-                self.draw_layer_actions_menu(ui, egui::pos2(right_center.x + 42.0, arrow_y));
 
                 // Paint
                 let dis = if self.dark_mode {
@@ -363,7 +370,12 @@ impl EntropyApp {
 
 #[cfg(test)]
 mod tests {
-    use super::{layer_after_wheel, main_menu_battery_status, MainMenuBatteryStatus};
+    use crate::app::DeviceAboutInfo;
+
+    use super::{
+        layer_after_wheel, main_menu_battery_status, main_menu_reserves_battery_status_space,
+        MainMenuBatteryStatus,
+    };
 
     #[test]
     fn split_batteries_keep_left_and_right_order() {
@@ -397,6 +409,22 @@ mod tests {
             MainMenuBatteryStatus::None
         );
         assert_eq!(main_menu_battery_status(None), MainMenuBatteryStatus::None);
+    }
+
+    #[test]
+    fn battery_capability_reserves_space_before_values_arrive() {
+        let mut info = DeviceAboutInfo {
+            supports_battery_halves: true,
+            ..Default::default()
+        };
+
+        assert!(main_menu_reserves_battery_status_space(Some(&info)));
+        info.battery_halves = Some(crate::hid::BatteryHalves {
+            left: Some(84),
+            right: Some(81),
+        });
+        assert!(main_menu_reserves_battery_status_space(Some(&info)));
+        assert!(!main_menu_reserves_battery_status_space(None));
     }
 
     #[test]

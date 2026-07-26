@@ -100,6 +100,8 @@ const VIAL_GUI_READ_TIMEOUT_MS: i32 = 500;
 const WINDOWS_BLE_READ_TIMEOUT_MS: i32 = 2_500;
 const WINDOWS_BLE_READ_SLICE_MS: i32 = 250;
 const WINDOWS_BLE_SETTLE_DELAY: Duration = Duration::from_millis(12);
+#[cfg(target_os = "linux")]
+const LINUX_BLE_NOTIFICATION_PROBE_TIMEOUT_MS: i32 = 80;
 #[cfg(target_os = "windows")]
 const WINDOWS_HID_HELPER_USB_COMMAND_TIMEOUT: Duration = Duration::from_millis(1_500);
 #[cfg(target_os = "windows")]
@@ -170,7 +172,7 @@ mod hid_macros;
 
 #[path = "hid_keymap.rs"]
 mod hid_keymap;
-pub(crate) use hid_keymap::{is_keycode_writeback_mismatch, keycode_writeback_readback};
+pub(crate) use hid_keymap::keycode_writeback_readback;
 
 #[path = "hid_settings.rs"]
 mod hid_settings;
@@ -405,29 +407,25 @@ impl HidDevice {
     pub fn open_fresh_for(device: &crate::device::Device) -> Result<Self> {
         #[cfg(target_os = "linux")]
         if device.uses_bluez_gatt_transport() {
-            match Self::open_fresh_for_local(device) {
-                Ok(hid) => {
+            match crate::linux_ble::LinuxBleDevice::open(device) {
+                Ok(bluez_device) => {
                     log::info!(
-                        "Using the Linux kernel HID transport for Bluetooth device {}",
+                        "Using direct BlueZ GATT for Bluetooth device {}",
                         device.name
                     );
-                    return Ok(hid);
+                    return Ok(Self {
+                        backend: HidBackend::LinuxBle(bluez_device),
+                    });
                 }
                 Err(error) => {
-                    if is_unsafe_bluetooth_report_map(&error) {
-                        return Err(error);
-                    }
                     log::warn!(
-                        "Linux kernel HID transport unavailable for {}: {error:#}; \
-                         falling back to direct BlueZ GATT",
+                        "Direct BlueZ GATT unavailable for {}: {error:#}; \
+                         falling back to the Linux kernel HID transport",
                         device.name
                     );
                 }
             }
-            return crate::linux_ble::LinuxBleDevice::open(device)
-                .map(|device| Self {
-                    backend: HidBackend::LinuxBle(device),
-                })
+            return Self::open_fresh_for_local(device)
                 .context("Failed to open the Linux Bluetooth Vial transport");
         }
 
@@ -838,39 +836,52 @@ fn usb_send_local(
             }
         }
 
-        match read_response(device, transport, write_framing, data, read_timeout_ms) {
-            Ok(resp) => return Ok(resp),
-            Err(e) => {
-                #[cfg(target_os = "linux")]
-                if transport.is_bluetooth() {
-                    let notification_error = e;
-                    match read_response_via_input_report(
-                        device,
-                        write_framing,
-                        data,
-                        read_timeout_ms,
-                    ) {
-                        Ok(resp) => {
-                            input_report_polling.store(true, std::sync::atomic::Ordering::Relaxed);
-                            static LOG_INPUT_REPORT_FALLBACK_ONCE: std::sync::Once =
-                                std::sync::Once::new();
-                            LOG_INPUT_REPORT_FALLBACK_ONCE.call_once(|| {
-                                log::info!(
-                                    "Linux Bluetooth HID notifications unavailable; \
-                                     using Get Input Report polling"
-                                );
-                            });
-                            return Ok(resp);
-                        }
-                        Err(input_report_error) => {
+        #[cfg(target_os = "linux")]
+        if transport.is_bluetooth() {
+            let notification_probe_error = match read_response(
+                device,
+                transport,
+                write_framing,
+                data,
+                LINUX_BLE_NOTIFICATION_PROBE_TIMEOUT_MS,
+            ) {
+                Ok(response) => return Ok(response),
+                Err(error) => error,
+            };
+            match read_response_via_input_report(device, write_framing, data, read_timeout_ms) {
+                Ok(response) => {
+                    input_report_polling.store(true, std::sync::atomic::Ordering::Relaxed);
+                    static LOG_INPUT_REPORT_FALLBACK_ONCE: std::sync::Once = std::sync::Once::new();
+                    LOG_INPUT_REPORT_FALLBACK_ONCE.call_once(|| {
+                        log::info!(
+                            "Linux Bluetooth HID notifications unavailable; \
+                             using Get Input Report polling"
+                        );
+                    });
+                    return Ok(response);
+                }
+                Err(input_report_error) => {
+                    // Some HID stacks expose notifications but reject
+                    // GET_REPORT. Give a slow notification the original full
+                    // timeout before failing the command.
+                    match read_response(device, transport, write_framing, data, read_timeout_ms) {
+                        Ok(response) => return Ok(response),
+                        Err(notification_error) => {
                             last_error = Some(anyhow::anyhow!(
-                                "HID notification failed: {notification_error}; \
-                                 Get Input Report fallback failed: {input_report_error}"
+                                "HID notification probe failed: {notification_probe_error}; \
+                                 Get Input Report fallback failed: {input_report_error}; \
+                                 full notification wait failed: {notification_error}"
                             ));
                             continue;
                         }
                     }
                 }
+            }
+        }
+
+        match read_response(device, transport, write_framing, data, read_timeout_ms) {
+            Ok(resp) => return Ok(resp),
+            Err(e) => {
                 last_error = Some(e);
                 continue;
             }

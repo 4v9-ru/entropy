@@ -201,7 +201,9 @@ impl EntropyApp {
         self.draw_ui_scale_controls(ui, zoom_left_top);
 
         #[cfg(not(target_arch = "wasm32"))]
-        let undo_enabled = !self.undo_stack.is_empty() && !self.hid_write_lifecycle_busy();
+        let undo_enabled = !self.undo_stack.is_empty()
+            && !self.pending_layout_undo
+            && !self.hid_user_action_busy();
         #[cfg(target_arch = "wasm32")]
         let undo_enabled = !self.undo_stack.is_empty();
         let undo_resp = ui.allocate_rect(undo_rect, Sense::CLICK);
@@ -215,7 +217,7 @@ impl EntropyApp {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
         if undo_resp.clicked() && undo_enabled {
-            self.undo();
+            self.undo(ctx);
             ctx.request_repaint();
         }
         let undo_color = if !undo_enabled {

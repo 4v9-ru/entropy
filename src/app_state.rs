@@ -317,6 +317,7 @@ pub(crate) enum DeferredLoadSection {
     TapDance,
     KeyOverrides,
     AltRepeat,
+    BehaviorSettings,
     Modules,
     Touchpad,
     Bluetooth,
@@ -334,12 +335,13 @@ pub(crate) enum DeferredFullLayoutAction {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl DeferredLoadSection {
-    pub(crate) const ALL: [Self; 10] = [
+    pub(crate) const ALL: [Self; 11] = [
         Self::Macros,
         Self::Combos,
         Self::TapDance,
         Self::KeyOverrides,
         Self::AltRepeat,
+        Self::BehaviorSettings,
         Self::Modules,
         Self::Touchpad,
         Self::Bluetooth,
@@ -366,6 +368,46 @@ impl DeferredLoadStatus {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BackgroundLayerStep {
+    Keymap { local_offset: usize },
+    Encoder { encoder_index: usize },
+    FirmwareName,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum BackgroundLayerStepResult {
+    Keymap {
+        local_offset: usize,
+        keycodes: Vec<u16>,
+    },
+    Encoder {
+        encoder_index: usize,
+        keycodes: (u16, u16),
+    },
+    FirmwareName(Option<String>),
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) struct BackgroundLayerData {
+    pub(crate) layer: usize,
+    pub(crate) keymap: Vec<u16>,
+    pub(crate) encoders: Vec<(u16, u16)>,
+    pub(crate) firmware_name: Option<String>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Default)]
+struct BackgroundLayerProgress {
+    layer: usize,
+    keymap: Vec<u16>,
+    encoders: Vec<(u16, u16)>,
+    firmware_name: Option<String>,
+    firmware_name_attempted: bool,
+}
+
 /// Immutable metadata needed to finish a staged Bluetooth load through the
 /// existing serialized HID owner. Mutable device values deliberately live in
 /// EntropyApp, not in this context.
@@ -389,6 +431,7 @@ pub(crate) struct DeferredDeviceLoadContext {
     pub(crate) touchpad_supported: bool,
     pub(crate) bluetooth_supported: bool,
     pub(crate) layer_leds_supported: bool,
+    pub(crate) rgb_supported: bool,
     pub(crate) lighting_mode: Option<String>,
 }
 
@@ -401,11 +444,15 @@ impl DeferredDeviceLoadContext {
             DeferredLoadSection::TapDance => self.tap_dance_count > 0,
             DeferredLoadSection::KeyOverrides => self.key_override_count > 0,
             DeferredLoadSection::AltRepeat => self.alt_repeat_count > 0,
+            DeferredLoadSection::BehaviorSettings => self
+                .supported_qmk_settings
+                .iter()
+                .any(|qsid| matches!(*qsid, 1..=7 | 9..=27)),
             DeferredLoadSection::Modules => self.modules_supported,
             DeferredLoadSection::Touchpad => self.touchpad_supported,
             DeferredLoadSection::Bluetooth => self.bluetooth_supported,
             DeferredLoadSection::LayerLeds => self.layer_leds_supported,
-            DeferredLoadSection::Rgb => self.lighting_mode.is_some(),
+            DeferredLoadSection::Rgb => self.rgb_supported,
         }
     }
 
@@ -426,6 +473,7 @@ impl DeferredDeviceLoadContext {
             && self.touchpad_supported == other.touchpad_supported
             && self.bluetooth_supported == other.bluetooth_supported
             && self.layer_leds_supported == other.layer_leds_supported
+            && self.rgb_supported == other.rgb_supported
             && self.lighting_mode == other.lighting_mode
     }
 }
@@ -436,7 +484,17 @@ pub(crate) struct DeferredDeviceLoadState {
     pub(crate) context: Option<std::sync::Arc<DeferredDeviceLoadContext>>,
     section_statuses: std::collections::BTreeMap<DeferredLoadSection, DeferredLoadStatus>,
     layer_statuses: Vec<DeferredLoadStatus>,
+    background_layer_progress: Option<BackgroundLayerProgress>,
+    background_layer_resume_at: Option<std::time::Instant>,
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+const BACKGROUND_LAYER_INITIAL_IDLE: std::time::Duration = std::time::Duration::from_millis(750);
+#[cfg(not(target_arch = "wasm32"))]
+const BACKGROUND_LAYER_BETWEEN_REQUESTS: std::time::Duration = std::time::Duration::from_millis(80);
+#[cfg(not(target_arch = "wasm32"))]
+const BACKGROUND_LAYER_AFTER_USER_INPUT: std::time::Duration =
+    std::time::Duration::from_millis(600);
 
 #[cfg(not(target_arch = "wasm32"))]
 impl DeferredDeviceLoadState {
@@ -459,6 +517,10 @@ impl DeferredDeviceLoadState {
             context: Some(context),
             section_statuses,
             layer_statuses,
+            background_layer_progress: None,
+            background_layer_resume_at: Some(
+                std::time::Instant::now() + BACKGROUND_LAYER_INITIAL_IDLE,
+            ),
         }
     }
 
@@ -470,6 +532,8 @@ impl DeferredDeviceLoadState {
                 .map(|section| (section, DeferredLoadStatus::Loaded))
                 .collect(),
             layer_statuses: vec![DeferredLoadStatus::Loaded; layer_count.max(1)],
+            background_layer_progress: None,
+            background_layer_resume_at: None,
         }
     }
 
@@ -507,6 +571,14 @@ impl DeferredDeviceLoadState {
     }
 
     pub(crate) fn set_layer_status(&mut self, layer: usize, status: DeferredLoadStatus) {
+        if !matches!(&status, DeferredLoadStatus::NotLoaded)
+            && self
+                .background_layer_progress
+                .as_ref()
+                .is_some_and(|progress| progress.layer == layer)
+        {
+            self.background_layer_progress = None;
+        }
         if let Some(current) = self.layer_statuses.get_mut(layer) {
             *current = status;
         }
@@ -528,6 +600,194 @@ impl DeferredDeviceLoadState {
 
     pub(crate) fn all_layers_ready(&self) -> bool {
         self.layer_statuses.iter().all(DeferredLoadStatus::ready)
+    }
+
+    pub(crate) fn background_layer_resume_delay(&self) -> Option<std::time::Duration> {
+        self.background_layer_resume_at
+            .and_then(|resume_at| resume_at.checked_duration_since(std::time::Instant::now()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn allow_background_layer_now_for_test(&mut self) {
+        self.background_layer_resume_at = None;
+    }
+
+    pub(crate) fn mark_background_layer_finished(&mut self) {
+        self.defer_background_for(BACKGROUND_LAYER_BETWEEN_REQUESTS);
+    }
+
+    pub(crate) fn defer_background_for_user_input(&mut self) {
+        self.defer_background_for(BACKGROUND_LAYER_AFTER_USER_INPUT);
+    }
+
+    fn defer_background_for(&mut self, duration: std::time::Duration) {
+        let resume_at = std::time::Instant::now() + duration;
+        self.background_layer_resume_at = Some(
+            self.background_layer_resume_at
+                .map(|current| current.max(resume_at))
+                .unwrap_or(resume_at),
+        );
+    }
+
+    pub(crate) fn next_background_layer_step(&self) -> Option<(usize, BackgroundLayerStep)> {
+        let context = self.context.as_ref()?;
+        let progress = self.background_layer_progress.as_ref().filter(|progress| {
+            matches!(
+                self.layer_status(progress.layer),
+                DeferredLoadStatus::NotLoaded
+            )
+        });
+        let layer = progress
+            .map(|progress| progress.layer)
+            .or_else(|| self.next_unloaded_layer())?;
+        let loaded_keycodes = progress.map(|progress| progress.keymap.len()).unwrap_or(0);
+        let layer_keycodes = context.rows.checked_mul(context.cols)?;
+        if loaded_keycodes < layer_keycodes {
+            return Some((
+                layer,
+                BackgroundLayerStep::Keymap {
+                    local_offset: loaded_keycodes * 2,
+                },
+            ));
+        }
+
+        let loaded_encoders = progress
+            .map(|progress| progress.encoders.len())
+            .unwrap_or(0);
+        if loaded_encoders < context.encoder_count {
+            return Some((
+                layer,
+                BackgroundLayerStep::Encoder {
+                    encoder_index: loaded_encoders,
+                },
+            ));
+        }
+
+        let qsid = u16::try_from(layer).ok()?.checked_add(200)?;
+        let needs_firmware_name = context.supported_qmk_settings.contains(&qsid);
+        if needs_firmware_name
+            && !progress
+                .map(|progress| progress.firmware_name_attempted)
+                .unwrap_or(false)
+        {
+            return Some((layer, BackgroundLayerStep::FirmwareName));
+        }
+
+        None
+    }
+
+    pub(crate) fn record_background_layer_step(
+        &mut self,
+        layer: usize,
+        result: BackgroundLayerStepResult,
+    ) -> Result<Option<BackgroundLayerData>, String> {
+        let context = self
+            .context
+            .clone()
+            .ok_or_else(|| "background layer result arrived outside a staged load".to_owned())?;
+        if !matches!(self.layer_status(layer), DeferredLoadStatus::NotLoaded) {
+            return Err(format!(
+                "background layer {layer} result arrived while the layer was not pending"
+            ));
+        }
+        let layer_keycodes = context
+            .rows
+            .checked_mul(context.cols)
+            .ok_or_else(|| "background layer dimensions overflow".to_owned())?;
+        let progress =
+            self.background_layer_progress
+                .get_or_insert_with(|| BackgroundLayerProgress {
+                    layer,
+                    ..Default::default()
+                });
+        if progress.layer != layer {
+            return Err(format!(
+                "background layer {layer} result interrupted layer {}",
+                progress.layer
+            ));
+        }
+
+        match result {
+            BackgroundLayerStepResult::Keymap {
+                local_offset,
+                keycodes,
+            } => {
+                let expected_offset = progress.keymap.len() * 2;
+                if local_offset != expected_offset
+                    || keycodes.is_empty()
+                    || progress.keymap.len() + keycodes.len() > layer_keycodes
+                {
+                    return Err(format!(
+                        "invalid background keymap chunk for layer {layer}: offset={local_offset}, expected={expected_offset}, keycodes={}",
+                        keycodes.len()
+                    ));
+                }
+                progress.keymap.extend(keycodes);
+            }
+            BackgroundLayerStepResult::Encoder {
+                encoder_index,
+                keycodes,
+            } => {
+                if progress.keymap.len() != layer_keycodes
+                    || encoder_index != progress.encoders.len()
+                    || encoder_index >= context.encoder_count
+                {
+                    return Err(format!(
+                        "invalid background encoder step for layer {layer}: encoder={encoder_index}"
+                    ));
+                }
+                progress.encoders.push(keycodes);
+            }
+            BackgroundLayerStepResult::FirmwareName(firmware_name) => {
+                let qsid = u16::try_from(layer)
+                    .ok()
+                    .and_then(|layer| layer.checked_add(200));
+                if progress.keymap.len() != layer_keycodes
+                    || progress.encoders.len() != context.encoder_count
+                    || !qsid.is_some_and(|qsid| context.supported_qmk_settings.contains(&qsid))
+                {
+                    return Err(format!(
+                        "unexpected background layer-name step for layer {layer}"
+                    ));
+                }
+                progress.firmware_name = firmware_name;
+                progress.firmware_name_attempted = true;
+            }
+        }
+
+        let qsid = u16::try_from(layer)
+            .ok()
+            .and_then(|layer| layer.checked_add(200));
+        let firmware_name_ready = !qsid
+            .is_some_and(|qsid| context.supported_qmk_settings.contains(&qsid))
+            || progress.firmware_name_attempted;
+        let complete = progress.keymap.len() == layer_keycodes
+            && progress.encoders.len() == context.encoder_count
+            && firmware_name_ready;
+        if !complete {
+            return Ok(None);
+        }
+
+        let progress = self
+            .background_layer_progress
+            .take()
+            .expect("completed background layer progress exists");
+        Ok(Some(BackgroundLayerData {
+            layer,
+            keymap: progress.keymap,
+            encoders: progress.encoders,
+            firmware_name: progress.firmware_name,
+        }))
+    }
+
+    pub(crate) fn clear_background_layer_progress(&mut self, layer: usize) {
+        if self
+            .background_layer_progress
+            .as_ref()
+            .is_some_and(|progress| progress.layer == layer)
+        {
+            self.background_layer_progress = None;
+        }
     }
 
     pub(crate) fn merge_loaded_from(&mut self, previous: &Self) {
@@ -1577,6 +1837,22 @@ impl GraveEscapeSettingsState {
     }
 }
 
+/// QMK behavior values that are not needed to draw the first keyboard layer.
+///
+/// Bluetooth reads these through the serialized deferred-load owner when the
+/// user opens a page that needs them. USB keeps loading them during connect.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct BehaviorSettingsState {
+    pub(crate) combo_term: Option<u16>,
+    pub(crate) auto_shift_options: AutoShiftOptionsState,
+    pub(crate) auto_shift_timeout: Option<u16>,
+    pub(crate) mouse_keys: MouseKeysSettingsState,
+    pub(crate) tap_hold: TapHoldSettingsState,
+    pub(crate) magic: MagicSettingsState,
+    pub(crate) one_shot: OneShotSettingsState,
+    pub(crate) grave_escape: GraveEscapeSettingsState,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LayerLedColorSetting {
     pub(crate) qsid: u16,
@@ -1633,6 +1909,36 @@ pub(crate) struct LayerLedSettingsState {
     pub(crate) timeout_unit: LayerLedTimeoutUnit,
     /// Whether any Ergohaven LED QMK setting was readable (firmware support flag)
     pub(crate) supported: bool,
+}
+
+impl LayerLedSettingsState {
+    pub(crate) fn set_value(&mut self, qsid: u16, value: u16) -> bool {
+        if let Some(setting) = self
+            .brightness
+            .as_mut()
+            .filter(|setting| setting.qsid == qsid)
+        {
+            setting.value = value.min(setting.max);
+            return true;
+        }
+        if let Some(setting) = self.timeout.as_mut().filter(|setting| setting.qsid == qsid) {
+            setting.value = value.min(setting.max);
+            return true;
+        }
+
+        let color = value.min((LAYER_LED_PALETTE.len() - 1) as u16) as u8;
+        for setting in self
+            .bt_profile_colors
+            .iter_mut()
+            .chain(self.layer_colors.iter_mut())
+        {
+            if setting.qsid == qsid || setting.linked_qsids.contains(&qsid) {
+                setting.value = color;
+                return true;
+            }
+        }
+        false
+    }
 }
 
 impl Default for LayerLedSettingsState {
@@ -3358,6 +3664,10 @@ pub struct EntropyApp {
     /// Background whole-layer HID write. Owns the device handle while active.
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) layer_write_task: Option<LayerWriteTask>,
+    /// Layer mutation waiting for a low-priority Bluetooth layer read to release
+    /// the shared HID handle.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) pending_layer_write: Option<PendingLayerWrite>,
     /// Background combo HID write. Owns the device handle while active.
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) combo_write_task: Option<ComboWriteTask>,
@@ -3367,6 +3677,10 @@ pub struct EntropyApp {
     /// Serialized live Vial read/control operation. Owns the HID handle while active.
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) vial_hid_task: Option<VialHidTask>,
+    /// Undo intent captured while a low-priority Bluetooth layer read owns the
+    /// HID handle. It is started before another automatic layer read.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) pending_layout_undo: bool,
     /// Sole readiness owner for staged Bluetooth layers and settings pages.
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) deferred_device_load: DeferredDeviceLoadState,

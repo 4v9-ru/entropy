@@ -68,23 +68,56 @@ fn cache_component(value: &str) -> String {
     }
 }
 
-fn device_cache_key(device: &crate::device::Device, keyboard_id: u64) -> String {
+fn device_cache_key_with_identity(
+    device: &crate::device::Device,
+    keyboard_id: u64,
+    include_manufacturer: bool,
+    include_serial: bool,
+) -> String {
     // RMK boards can report the same Vial keyboard id across different layouts.
     // Keep the cache tied to the concrete HID identity so one board's layout
-    // definition cannot be reused for another board.
+    // definition cannot be reused for another board. Bluetooth addresses are
+    // deliberately excluded from the canonical key: BlueZ can expose a new
+    // address after clearing a bond even though the keyboard schema is unchanged.
     let mut parts = vec![
         format!("{keyboard_id:016x}"),
         format!("{:04x}", device.vendor_id),
         format!("{:04x}", device.product_id),
         cache_component(&device.name),
     ];
-    if !device.manufacturer.trim().is_empty() {
+    if include_manufacturer && !device.manufacturer.trim().is_empty() {
         parts.push(cache_component(&device.manufacturer));
     }
-    if !device.serial_number.trim().is_empty() {
+    if include_serial && !device.serial_number.trim().is_empty() {
         parts.push(cache_component(&device.serial_number));
     }
     parts.join("_")
+}
+
+fn device_cache_keys(device: &crate::device::Device, keyboard_id: u64) -> Vec<String> {
+    if device.is_bluetooth_transport() {
+        let mut keys = Vec::with_capacity(3);
+        for (include_manufacturer, include_serial) in [(false, false), (true, false), (true, true)]
+        {
+            let key = device_cache_key_with_identity(
+                device,
+                keyboard_id,
+                include_manufacturer,
+                include_serial,
+            );
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+        keys
+    } else {
+        vec![device_cache_key_with_identity(
+            device,
+            keyboard_id,
+            true,
+            true,
+        )]
+    }
 }
 
 fn cached_vial_definition_file_name(cache_key: &str, definition_size: u32) -> String {
@@ -167,16 +200,20 @@ fn load_cached_vial_definition_from_dir(
 }
 
 fn load_cached_vial_definition(
-    cache_key: &str,
+    cache_keys: &[String],
     definition_size: u32,
     runtime_firmware_version: Option<&str>,
-) -> Option<serde_json::Value> {
-    load_cached_vial_definition_from_dir(
-        &vial_cache_dir()?,
-        cache_key,
-        definition_size,
-        runtime_firmware_version,
-    )
+) -> Option<(serde_json::Value, String)> {
+    let cache_dir = vial_cache_dir()?;
+    cache_keys.iter().find_map(|cache_key| {
+        load_cached_vial_definition_from_dir(
+            &cache_dir,
+            cache_key,
+            definition_size,
+            runtime_firmware_version,
+        )
+        .map(|json| (json, cache_key.clone()))
+    })
 }
 
 fn save_cached_vial_definition(
@@ -209,12 +246,14 @@ fn parse_cached_qmk_settings(text: &str, context: &QmkSettingsCacheContext) -> O
 }
 
 fn load_cached_qmk_settings(
-    cache_key: &str,
+    cache_keys: &[String],
     context: &QmkSettingsCacheContext,
-) -> Option<Vec<u16>> {
-    let path = cached_qmk_settings_path(cache_key)?;
-    let text = std::fs::read_to_string(path).ok()?;
-    parse_cached_qmk_settings(&text, context)
+) -> Option<(Vec<u16>, String)> {
+    cache_keys.iter().find_map(|cache_key| {
+        let path = cached_qmk_settings_path(cache_key)?;
+        let text = std::fs::read_to_string(path).ok()?;
+        parse_cached_qmk_settings(&text, context).map(|settings| (settings, cache_key.clone()))
+    })
 }
 
 fn save_cached_qmk_settings(cache_key: &str, context: &QmkSettingsCacheContext, settings: &[u16]) {
@@ -471,16 +510,23 @@ impl EntropyApp {
             return;
         };
 
-        let cache_key = device_cache_key(&device, info.keyboard_id);
-        if let Err(error) = clear_cached_device_data(&cache_key) {
-            self.status_msg =
-                crate::i18n::tr_catalog(lang, "status_messages.refresh_device_data_delete_failed")
-                    .to_owned();
-            log::warn!("device cache refresh failed for key {cache_key}: {error}");
-            return;
+        let cache_keys = device_cache_keys(&device, info.keyboard_id);
+        for cache_key in &cache_keys {
+            if let Err(error) = clear_cached_device_data(cache_key) {
+                self.status_msg = crate::i18n::tr_catalog(
+                    lang,
+                    "status_messages.refresh_device_data_delete_failed",
+                )
+                .to_owned();
+                log::warn!("device cache refresh failed for key {cache_key}: {error}");
+                return;
+            }
         }
 
-        log::info!("Cleared Vial definition and QMK settings cache for key {cache_key}");
+        log::info!(
+            "Cleared Vial definition and QMK settings cache for keys {}",
+            cache_keys.join(", ")
+        );
         self.start_connect(device_idx);
     }
 
@@ -525,6 +571,8 @@ impl EntropyApp {
             }
         }
         self.pending_device_connect = None;
+        self.pending_layout_undo = false;
+        self.pending_layer_write = None;
         let dev = match self.device_manager.devices().get(device_idx) {
             Some(d) => d.clone(),
             None => {
@@ -655,7 +703,8 @@ impl EntropyApp {
                     .get_keyboard_id()
                     .map_err(|e| format!("Vial keyboard id read failed: {e:#}"))?;
                 log::info!("Vial protocol: {vial_protocol}, keyboard id: {keyboard_id:016X}");
-                let cache_key = device_cache_key(&dev, keyboard_id);
+                let cache_keys = device_cache_keys(&dev, keyboard_id);
+                let cache_key = &cache_keys[0];
                 if ![-1i32, 9].contains(&(via_protocol as i32)) {
                     return Err(format!("Unsupported VIA protocol version: {via_protocol}"));
                 }
@@ -695,14 +744,24 @@ impl EntropyApp {
                     .map_err(|e| format!("Layout size read failed: {e:#}"))?;
                 let runtime_firmware_cache_token =
                     runtime_firmware_version_cache_token(runtime_firmware_version.as_deref());
-                let json = if let Some(cached) = load_cached_vial_definition(
-                    &cache_key,
+                let json = if let Some((cached, source_cache_key)) = load_cached_vial_definition(
+                    &cache_keys,
                     definition_size,
                     runtime_firmware_cache_token,
                 ) {
                     log::info!(
-                        "Loaded Vial definition from cache for keyboard id {keyboard_id:016X}, key {cache_key}, size {definition_size}"
+                        "Loaded Vial definition from cache for keyboard id {keyboard_id:016X}, key {source_cache_key}, size {definition_size}"
                     );
+                    if source_cache_key != *cache_key {
+                        if let Some(runtime_firmware_version) = runtime_firmware_cache_token {
+                            save_cached_vial_definition(
+                                cache_key,
+                                definition_size,
+                                runtime_firmware_version,
+                                &cached,
+                            );
+                        }
+                    }
                     cached
                 } else {
                     let json = dev_conn
@@ -710,7 +769,7 @@ impl EntropyApp {
                         .map_err(|e| format!("Layout read failed: {e:#}"))?;
                     if let Some(runtime_firmware_version) = runtime_firmware_cache_token {
                         save_cached_vial_definition(
-                            &cache_key,
+                            cache_key,
                             definition_size,
                             runtime_firmware_version,
                             &json,
@@ -761,19 +820,25 @@ impl EntropyApp {
                 let supported_qmk_settings = if vial_protocol >= 4 {
                     if let Some(cached) = qmk_cache_context
                         .as_ref()
-                        .and_then(|context| load_cached_qmk_settings(&cache_key, context))
+                        .and_then(|context| load_cached_qmk_settings(&cache_keys, context))
                     {
+                        let (cached, source_cache_key) = cached;
                         log::info!(
-                            "Loaded {} QMK settings from definition-aware cache for keyboard id {keyboard_id:016X}, key {cache_key}",
+                            "Loaded {} QMK settings from definition-aware cache for keyboard id {keyboard_id:016X}, key {source_cache_key}",
                             cached.len(),
                         );
+                        if source_cache_key != *cache_key {
+                            if let Some(context) = qmk_cache_context.as_ref() {
+                                save_cached_qmk_settings(cache_key, context, &cached);
+                            }
+                        }
                         cached
                     } else {
                         progress("Querying QMK settings…");
                         match dev_conn.query_qmk_settings() {
                             Ok(settings) => {
                                 if let Some(context) = qmk_cache_context.as_ref() {
-                                    save_cached_qmk_settings(&cache_key, context, &settings);
+                                    save_cached_qmk_settings(cache_key, context, &settings);
                                 }
                                 settings
                             }
@@ -1019,76 +1084,11 @@ impl EntropyApp {
                     entries
                 };
 
-                progress("Reading QMK settings values…");
-                let combo_term = if has_qmk_setting(2) {
-                    match dev_conn.get_qmk_setting_u16(2) {
-                        Ok(value) => Some(value),
-                        Err(e) => {
-                            log::warn!("get_qmk_setting_u16(combo_term): {e}");
-                            None
-                        }
-                    }
+                let behavior_settings = if staged_bluetooth_load {
+                    BehaviorSettingsState::default()
                 } else {
-                    None
-                };
-                let auto_shift_options = if has_qmk_setting(3) {
-                    match dev_conn.get_qmk_setting_u8(3) {
-                        Ok(value) => Some(AutoShiftOptionsState::from_bits(value)),
-                        Err(e) => {
-                            log::warn!("get_qmk_setting_u8(auto_shift_flags): {e}");
-                            None
-                        }
-                    }
-                } else {
-                    None
-                };
-                let auto_shift_timeout = if has_qmk_setting(4) {
-                    match dev_conn.get_qmk_setting_u16(4) {
-                        Ok(value) => Some(value),
-                        Err(e) => {
-                            log::warn!("get_qmk_setting_u16(auto_shift_timeout): {e}");
-                            None
-                        }
-                    }
-                } else {
-                    None
-                };
-
-                let mouse_keys_settings = {
-                    let mut mk = MouseKeysSettingsState::default();
-                    match has_qmk_setting(9).then(|| dev_conn.get_qmk_setting_u8(9)) {
-                        Some(Ok(v)) => {
-                            mk.delay = v as u16;
-                            mk.supported = true;
-                            let read = |qsid: u16| -> u16 {
-                                if !has_qmk_setting(qsid) {
-                                    return 0;
-                                }
-                                match dev_conn.get_qmk_setting_u8(qsid) {
-                                    Ok(val) => val as u16,
-                                    Err(e) => {
-                                        log::warn!(
-                                            "get_qmk_setting_u8(mouse_keys qsid {qsid}): {e}"
-                                        );
-                                        0
-                                    }
-                                }
-                            };
-                            mk.interval = read(10);
-                            mk.move_delta = read(11);
-                            mk.max_speed = read(12);
-                            mk.time_to_max = read(13);
-                            mk.wheel_delay = read(14);
-                            mk.wheel_interval = read(15);
-                            mk.wheel_max_speed = read(16);
-                            mk.wheel_time_to_max = read(17);
-                        }
-                        Some(Err(e)) => {
-                            log::warn!("get_qmk_setting_u8(mouse_keys delay): {e}");
-                        }
-                        None => {}
-                    }
-                    mk
+                    progress("Reading QMK settings values…");
+                    Self::read_behavior_settings(&supported_qmk_settings, &dev_conn)
                 };
 
                 let touchpad_settings = if staged_bluetooth_load {
@@ -1106,130 +1106,9 @@ impl EntropyApp {
 
                 progress("Reading module settings…");
                 let module_settings = if staged_bluetooth_load {
-                    ModuleSettingsState::default()
+                    Self::module_settings_from_definition(&json, &supported_qmk_settings)
                 } else {
                     Self::read_module_settings(&json, &supported_qmk_settings, &dev_conn)
-                };
-
-                let tap_hold_settings = {
-                    let mut th = TapHoldSettingsState::default();
-                    match has_qmk_setting(7).then(|| dev_conn.get_qmk_setting_u16(7)) {
-                        Some(Ok(v)) => {
-                            th.tapping_term = v;
-                            th.supported = true;
-                            for qsid in [7u16, 18, 19, 20, 22, 23, 24, 25, 26, 27] {
-                                if has_qmk_setting(qsid) {
-                                    th.set_qsid_supported(qsid);
-                                }
-                            }
-                            let read_bool = |qsid: u16| -> bool {
-                                if !has_qmk_setting(qsid) {
-                                    return false;
-                                }
-                                match dev_conn.get_qmk_setting_u8(qsid) {
-                                    Ok(val) => val != 0,
-                                    Err(e) => {
-                                        log::warn!("get_qmk_setting_u8(tap_hold qsid {qsid}): {e}");
-                                        false
-                                    }
-                                }
-                            };
-                            let read_u16 = |qsid: u16| -> u16 {
-                                if !has_qmk_setting(qsid) {
-                                    return 0;
-                                }
-                                match dev_conn.get_qmk_setting_u16(qsid) {
-                                    Ok(val) => val,
-                                    Err(e) => {
-                                        log::warn!(
-                                            "get_qmk_setting_u16(tap_hold qsid {qsid}): {e}"
-                                        );
-                                        0
-                                    }
-                                }
-                            };
-                            th.permissive_hold = read_bool(22);
-                            th.hold_on_other_key_press = read_bool(23);
-                            th.retro_tapping = read_bool(24);
-                            th.quick_tap_term = read_u16(25);
-                            th.tap_code_delay = read_u16(18);
-                            th.tap_hold_caps_delay = read_u16(19);
-                            th.tapping_toggle = if has_qmk_setting(20) {
-                                dev_conn
-                                    .get_qmk_setting_u8(20)
-                                    .map(|value| value as u16)
-                                    .unwrap_or_else(|e| {
-                                        log::warn!("get_qmk_setting_u8(tap_hold qsid 20): {e}");
-                                        0
-                                    })
-                            } else {
-                                0
-                            };
-                            th.chordal_hold = read_bool(26);
-                            th.flow_tap = read_u16(27);
-                        }
-                        Some(Err(e)) => {
-                            log::warn!("get_qmk_setting_u16(tap_hold tapping_term): {e}");
-                        }
-                        None => {}
-                    }
-                    th
-                };
-
-                let magic_settings = {
-                    match has_qmk_setting(21).then(|| dev_conn.get_qmk_setting_u16(21)) {
-                        Some(Ok(bits)) => MagicSettingsState {
-                            bits,
-                            supported: true,
-                        },
-                        Some(Err(e)) => {
-                            log::warn!("get_qmk_setting_u16(magic qsid 21): {e}");
-                            MagicSettingsState::default()
-                        }
-                        None => MagicSettingsState::default(),
-                    }
-                };
-
-                let one_shot_settings = {
-                    let mut os = OneShotSettingsState::default();
-                    if has_qmk_setting(5) {
-                        match dev_conn.get_qmk_setting_u8(5) {
-                            Ok(value) => {
-                                os.tap_toggle = value;
-                                os.set_qsid_supported(5);
-                            }
-                            Err(e) => {
-                                log::warn!("get_qmk_setting_u8(one_shot tap toggle qsid 5): {e}");
-                            }
-                        }
-                    }
-                    if has_qmk_setting(6) {
-                        match dev_conn.get_qmk_setting_u16(6) {
-                            Ok(value) => {
-                                os.timeout = value;
-                                os.set_qsid_supported(6);
-                            }
-                            Err(e) => {
-                                log::warn!("get_qmk_setting_u16(one_shot timeout qsid 6): {e}");
-                            }
-                        }
-                    }
-                    os.supported = os.supported_qsids != 0;
-                    os
-                };
-
-                let grave_escape_settings = {
-                    match has_qmk_setting(1).then(|| dev_conn.get_qmk_setting_u8(1)) {
-                        Some(Ok(bits)) => GraveEscapeSettingsState {
-                            bits,
-                            supported: true,
-                        },
-                        Some(Err(e)) => {
-                            log::warn!("get_qmk_setting_u8(grave_escape qsid 1): {e}");
-                            GraveEscapeSettingsState::default()
-                        }
-                        None => GraveEscapeSettingsState::default(),
-                    }
                 };
 
                 let layer_led_settings = if staged_bluetooth_load {
@@ -1351,8 +1230,7 @@ impl EntropyApp {
                 let deferred_load = if staged_bluetooth_load {
                     let definition_fingerprint = vial_definition_fingerprint(&json)
                         .map_err(|error| format!("Layout fingerprint failed: {error}"))?;
-                    let modules_supported =
-                        !Self::module_settings_groups(&json, &supported_qmk_settings).is_empty();
+                    let modules_supported = module_settings.supported;
                     let touchpad_supported = touchpad_settings_in_definition
                         && [120u16, 121, 122, 123, 124]
                             .iter()
@@ -1379,6 +1257,7 @@ impl EntropyApp {
                         touchpad_supported,
                         bluetooth_supported,
                         layer_leds_supported,
+                        rgb_supported: layout.supports_rgb,
                         lighting_mode: layout.lighting_mode.clone(),
                     })
                 } else {
@@ -1424,17 +1303,17 @@ impl EntropyApp {
                     macro_ext_keycodes_disabled_reason,
                     tap_dance_entries,
                     combo_entries,
-                    combo_term,
-                    auto_shift_options: auto_shift_options.unwrap_or_default(),
-                    auto_shift_timeout,
-                    mouse_keys_settings,
+                    combo_term: behavior_settings.combo_term,
+                    auto_shift_options: behavior_settings.auto_shift_options,
+                    auto_shift_timeout: behavior_settings.auto_shift_timeout,
+                    mouse_keys_settings: behavior_settings.mouse_keys,
                     touchpad_settings,
                     bluetooth_settings,
                     module_settings,
-                    tap_hold_settings,
-                    magic_settings,
-                    one_shot_settings,
-                    grave_escape_settings,
+                    tap_hold_settings: behavior_settings.tap_hold,
+                    magic_settings: behavior_settings.magic,
+                    one_shot_settings: behavior_settings.one_shot,
+                    grave_escape_settings: behavior_settings.grave_escape,
                     layer_led_settings,
                     rgb_settings,
                     layout_options_value,
@@ -1553,6 +1432,54 @@ mod tests {
         });
 
         assert!(supports_battery_halves_from_vial_json(&json));
+    }
+
+    fn cache_device(bus_type: &str, serial_number: &str) -> crate::device::Device {
+        crate::device::Device {
+            name: "K:04".to_owned(),
+            vendor_id: 0xE126,
+            product_id: 0x0074,
+            manufacturer: "Ergohaven".to_owned(),
+            serial_number: serial_number.to_owned(),
+            bus_type: bus_type.to_owned(),
+            path: if bus_type.eq_ignore_ascii_case("bluetooth") {
+                format!("/org/bluez/hci0/dev_{}", serial_number.replace(':', "_"))
+            } else {
+                "/dev/hidraw4".to_owned()
+            },
+            firmware: FirmwareProtocol::Vial,
+        }
+    }
+
+    #[test]
+    fn bluetooth_schema_cache_key_survives_peer_address_changes() {
+        let first = device_cache_keys(&cache_device("Bluetooth", "AA:BB:CC:DD:EE:01"), 0x1234);
+        let second = device_cache_keys(&cache_device("Bluetooth", "AA:BB:CC:DD:EE:02"), 0x1234);
+
+        assert_eq!(first[0], second[0]);
+        assert_ne!(first.last(), second.last());
+    }
+
+    #[test]
+    fn bluetooth_schema_cache_key_survives_kernel_and_bluez_metadata() {
+        let kernel = cache_device("Bluetooth", "AA:BB:CC:DD:EE:01");
+        let mut bluez = kernel.clone();
+        bluez.manufacturer.clear();
+
+        assert_eq!(
+            device_cache_keys(&kernel, 0x1234)[0],
+            device_cache_keys(&bluez, 0x1234)[0]
+        );
+    }
+
+    #[test]
+    fn usb_schema_cache_stays_bound_to_the_device_serial() {
+        let first = device_cache_keys(&cache_device("Usb", "keyboard-1"), 0x1234);
+        let second = device_cache_keys(&cache_device("Usb", "keyboard-2"), 0x1234);
+
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_ne!(first[0], second[0]);
     }
 
     #[test]

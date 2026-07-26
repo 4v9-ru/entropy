@@ -147,6 +147,8 @@ impl EntropyApp {
 
         self.poll_layer_write(ctx);
         self.poll_combo_write(ctx);
+        self.maybe_start_pending_layout_undo(ctx);
+        self.maybe_start_pending_layer_write();
         self.maybe_start_combo_write(ctx);
         self.finish_deferred_exit_after_hid_write(ctx);
         self.poll_text_expander_deferred_save(now);
@@ -160,7 +162,7 @@ impl EntropyApp {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn import_pending(&self) -> bool {
+    pub(super) fn import_pending(&self) -> bool {
         self.pending_entlayout_import_path.is_some()
             || self.pending_entsettings_import_path.is_some()
     }
@@ -686,7 +688,7 @@ mod tests {
         });
         app.layout_options_value = Some(1);
 
-        app.apply_picker_results();
+        app.apply_picker_results(&ctx);
         assert_eq!(app.keycode_picker.result, Some(0x0004));
         assert_eq!(app.key_override_entries[0].trigger, 0);
 
@@ -753,10 +755,10 @@ mod tests {
         assert!(!app.hid_write_task_active());
         assert!(app.hid_device.is_some());
 
-        app.apply_picker_results();
+        app.apply_picker_results(&ctx);
         assert_eq!(app.key_override_entries[0].trigger, 0x0004);
         assert!(app.keycode_picker.result.is_none());
-        app.apply_picker_results();
+        app.apply_picker_results(&ctx);
         assert_eq!(app.key_override_entries[0].trigger, 0x0004);
         app.flush_pending_key_override_writes();
 
@@ -1164,8 +1166,9 @@ impl eframe::App for EntropyApp {
             if !ctx.input(|i| i.modifiers.ctrl) {
                 #[cfg(not(target_arch = "wasm32"))]
                 if !self.hid_write_task_active() {
-                    self.assign_keycode(layer, ki, kc);
-                    self.pending_handed_swap = None;
+                    if self.assign_keycode(ctx, layer, ki, kc) {
+                        self.pending_handed_swap = None;
+                    }
                 }
                 #[cfg(target_arch = "wasm32")]
                 {
@@ -1187,7 +1190,7 @@ impl eframe::App for EntropyApp {
         #[cfg(not(target_arch = "wasm32"))]
         self.poll_file_dialog(ctx);
 
-        self.apply_picker_results();
+        self.apply_picker_results(ctx);
 
         // Deselect key when picker is closed without choosing
         if !self.keycode_picker.open
@@ -1405,7 +1408,7 @@ impl eframe::App for EntropyApp {
                 let deferred_keyboard_blocked = self.main_menu_tab == MainMenuTab::Keyboard
                     && (!self.selected_layer_data_ready()
                         || !self.sticky_layout_deferred_data_ready()
-                        || self.deferred_vial_hid_task_active()
+                        || self.deferred_vial_hid_task_blocks_keyboard()
                         || self.deferred_full_layout_action_pending());
                 #[cfg(target_arch = "wasm32")]
                 let deferred_keyboard_blocked = false;
@@ -1611,7 +1614,7 @@ impl eframe::App for EntropyApp {
             if let Some(tab) = self.keycode_picker.deferred_retry_tab.take() {
                 self.retry_picker_deferred_data(tab);
             }
-            self.apply_picker_results();
+            self.apply_picker_results(ctx);
         }
 
         if self.combo_pick_target.is_some()

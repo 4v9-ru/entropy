@@ -32,12 +32,16 @@ impl EntropyApp {
             hid_device: None,
             #[cfg(not(target_arch = "wasm32"))]
             layer_write_task: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            pending_layer_write: None,
             qmk_settings_write_queue: QmkSettingsWriteQueue::default(),
             #[cfg(not(target_arch = "wasm32"))]
             combo_write_task: None,
             settings_write_task: None,
             #[cfg(not(target_arch = "wasm32"))]
             vial_hid_task: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            pending_layout_undo: false,
             #[cfg(not(target_arch = "wasm32"))]
             deferred_device_load: DeferredDeviceLoadState::default(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -210,7 +214,7 @@ impl EntropyApp {
         }
     }
 
-    /// Assign keycode and immediately write to device (blocking, but single HID op — fast).
+    /// Recompute which layers contain assignable keycodes.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn refresh_layer_picker_content_flags(&mut self) {
         if let Some(layout) = &self.layout {

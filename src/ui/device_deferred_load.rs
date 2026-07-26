@@ -7,6 +7,11 @@ pub(super) enum DeferredLoadRequest {
         layer: usize,
         context: std::sync::Arc<DeferredDeviceLoadContext>,
     },
+    BackgroundLayerStep {
+        layer: usize,
+        step: BackgroundLayerStep,
+        context: std::sync::Arc<DeferredDeviceLoadContext>,
+    },
     Section {
         section: DeferredLoadSection,
         context: std::sync::Arc<DeferredDeviceLoadContext>,
@@ -17,16 +22,24 @@ pub(super) enum DeferredLoadRequest {
 impl DeferredLoadRequest {
     pub(super) fn layer(&self) -> Option<usize> {
         match self {
-            Self::Layer { layer, .. } => Some(*layer),
+            Self::Layer { layer, .. } | Self::BackgroundLayerStep { layer, .. } => Some(*layer),
             Self::Section { .. } => None,
         }
     }
 
     pub(super) fn section(&self) -> Option<DeferredLoadSection> {
         match self {
-            Self::Layer { .. } => None,
+            Self::Layer { .. } | Self::BackgroundLayerStep { .. } => None,
             Self::Section { section, .. } => Some(*section),
         }
+    }
+
+    pub(super) fn is_background_layer(&self) -> bool {
+        matches!(self, Self::BackgroundLayerStep { .. })
+    }
+
+    pub(super) fn blocks_keyboard(&self) -> bool {
+        !self.is_background_layer()
     }
 }
 
@@ -38,11 +51,16 @@ pub(super) enum DeferredLoadPayload {
         encoders: Vec<(u16, u16)>,
         firmware_name: Option<String>,
     },
+    BackgroundLayerStep {
+        layer: usize,
+        result: BackgroundLayerStepResult,
+    },
     Macros(Vec<Vec<u8>>),
     Combos(Vec<ComboEntry>),
     TapDance(Vec<crate::keycode_picker::TapDanceEntry>),
     KeyOverrides(Vec<KeyOverrideEntry>),
     AltRepeat(Vec<AltRepeatKeyEntry>),
+    BehaviorSettings(BehaviorSettingsState),
     Modules(ModuleSettingsState),
     Touchpad(TouchpadSettingsState),
     Bluetooth(BluetoothSettingsState),
@@ -63,6 +81,31 @@ const ENTLAYOUT_EXPORT_SECTIONS: [DeferredLoadSection; 5] = [
 enum DeferredOverlayTarget {
     Layer(usize, DeferredLoadStatus),
     Section(DeferredLoadSection, DeferredLoadStatus),
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn event_defers_automatic_background_load(event: &egui::Event) -> bool {
+    match event {
+        egui::Event::Copy
+        | egui::Event::Cut
+        | egui::Event::Paste(_)
+        | egui::Event::Text(_)
+        | egui::Event::Zoom(_)
+        | egui::Event::Rotate(_)
+        | egui::Event::MouseWheel { .. }
+        | egui::Event::AccessKitActionRequest(_) => true,
+        egui::Event::Key { pressed, .. } | egui::Event::PointerButton { pressed, .. } => *pressed,
+        egui::Event::Ime(egui::ImeEvent::Preedit(_) | egui::ImeEvent::Commit(_)) => true,
+        egui::Event::Touch { phase, .. } => {
+            matches!(phase, egui::TouchPhase::Start | egui::TouchPhase::Move)
+        }
+        egui::Event::PointerMoved(_)
+        | egui::Event::MouseMoved(_)
+        | egui::Event::PointerGone
+        | egui::Event::Ime(egui::ImeEvent::Enabled | egui::ImeEvent::Disabled)
+        | egui::Event::WindowFocused(_)
+        | egui::Event::Screenshot { .. } => false,
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -106,6 +149,56 @@ pub(super) fn run_deferred_load(
                 keymap,
                 encoders,
                 firmware_name,
+            })
+        }
+        DeferredLoadRequest::BackgroundLayerStep {
+            layer,
+            step,
+            context,
+        } => {
+            let result = match *step {
+                BackgroundLayerStep::Keymap { local_offset } => BackgroundLayerStepResult::Keymap {
+                    local_offset,
+                    keycodes: hid.get_keymap_layer_chunk(
+                        *layer,
+                        context.layer_count,
+                        context.rows,
+                        context.cols,
+                        local_offset,
+                    )?,
+                },
+                BackgroundLayerStep::Encoder { encoder_index } => {
+                    let keycodes = hid
+                        .get_encoder(*layer as u8, encoder_index as u8)
+                        .unwrap_or_else(|error| {
+                            log::warn!(
+                                "get_encoder(layer={layer}, idx={encoder_index}) during background load: {error}"
+                            );
+                            (0, 0)
+                        });
+                    BackgroundLayerStepResult::Encoder {
+                        encoder_index,
+                        keycodes,
+                    }
+                }
+                BackgroundLayerStep::FirmwareName => {
+                    let qsid = 200 + *layer as u16;
+                    let firmware_name = match hid.get_qmk_setting_string(qsid) {
+                        Ok(name) if !name.trim().is_empty() => Some(name),
+                        Ok(_) => None,
+                        Err(error) => {
+                            log::warn!(
+                                "get_qmk_setting_string(layer name qsid {qsid}) during background load: {error}"
+                            );
+                            None
+                        }
+                    };
+                    BackgroundLayerStepResult::FirmwareName(firmware_name)
+                }
+            };
+            Ok(DeferredLoadPayload::BackgroundLayerStep {
+                layer: *layer,
+                result,
             })
         }
         DeferredLoadRequest::Section { section, context } => {
@@ -205,6 +298,9 @@ pub(super) fn run_deferred_load(
                         .collect::<anyhow::Result<Vec<_>>>()?;
                     Ok(DeferredLoadPayload::AltRepeat(entries))
                 }
+                DeferredLoadSection::BehaviorSettings => Ok(DeferredLoadPayload::BehaviorSettings(
+                    EntropyApp::read_behavior_settings(&context.supported_qmk_settings, hid),
+                )),
                 DeferredLoadSection::Modules => Ok(DeferredLoadPayload::Modules(
                     EntropyApp::read_module_settings(
                         &context.json,
@@ -248,17 +344,25 @@ pub(super) fn run_deferred_load(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn settings_tab_deferred_section(tab: SettingsTab) -> Option<DeferredLoadSection> {
+fn settings_tab_deferred_sections(tab: SettingsTab) -> &'static [DeferredLoadSection] {
     match tab {
-        SettingsTab::Combo => Some(DeferredLoadSection::Combos),
-        SettingsTab::KeyOverrides => Some(DeferredLoadSection::KeyOverrides),
-        SettingsTab::AltRepeat => Some(DeferredLoadSection::AltRepeat),
-        SettingsTab::Modules => Some(DeferredLoadSection::Modules),
-        SettingsTab::Touchpad => Some(DeferredLoadSection::Touchpad),
-        SettingsTab::Bluetooth => Some(DeferredLoadSection::Bluetooth),
-        SettingsTab::LayerLeds => Some(DeferredLoadSection::LayerLeds),
-        SettingsTab::Rgb => Some(DeferredLoadSection::Rgb),
-        _ => None,
+        SettingsTab::Combo => &[
+            DeferredLoadSection::Combos,
+            DeferredLoadSection::BehaviorSettings,
+        ],
+        SettingsTab::AutoShift
+        | SettingsTab::Magic
+        | SettingsTab::TapHold
+        | SettingsTab::GraveEscape
+        | SettingsTab::MouseKeys => &[DeferredLoadSection::BehaviorSettings],
+        SettingsTab::KeyOverrides => &[DeferredLoadSection::KeyOverrides],
+        SettingsTab::AltRepeat => &[DeferredLoadSection::AltRepeat],
+        SettingsTab::Modules => &[DeferredLoadSection::Modules],
+        SettingsTab::Touchpad => &[DeferredLoadSection::Touchpad],
+        SettingsTab::Bluetooth => &[DeferredLoadSection::Bluetooth],
+        SettingsTab::LayerLeds => &[DeferredLoadSection::LayerLeds],
+        SettingsTab::Rgb => &[DeferredLoadSection::Rgb],
+        _ => &[],
     }
 }
 
@@ -354,7 +458,10 @@ impl EntropyApp {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn deferred_request_for_current_view(&self) -> Option<DeferredLoadRequest> {
+    fn deferred_request_for_current_view(
+        &self,
+        allow_automatic_background_layer: bool,
+    ) -> Option<DeferredLoadRequest> {
         let context = self.deferred_device_load.context.as_ref()?.clone();
 
         if matches!(
@@ -427,7 +534,7 @@ impl EntropyApp {
         }
 
         if self.main_menu_tab != MainMenuTab::Keyboard {
-            if let Some(section) = settings_tab_deferred_section(self.settings_tab) {
+            for &section in settings_tab_deferred_sections(self.settings_tab) {
                 if matches!(
                     self.deferred_device_load.section_status(section),
                     DeferredLoadStatus::NotLoaded
@@ -437,16 +544,40 @@ impl EntropyApp {
             }
         }
 
-        if self.main_menu_tab != MainMenuTab::Keyboard
-            && self.settings_tab != SettingsTab::MatrixTester
-            && !self.keycode_picker.open
-        {
-            if let Some(layer) = self.deferred_device_load.next_unloaded_layer() {
-                return Some(DeferredLoadRequest::Layer { layer, context });
+        if allow_automatic_background_layer {
+            if let Some((layer, step)) = self.deferred_device_load.next_background_layer_step() {
+                return Some(DeferredLoadRequest::BackgroundLayerStep {
+                    layer,
+                    step,
+                    context,
+                });
             }
         }
 
         None
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn automatic_background_layer_load_allowed(&mut self, ctx: &egui::Context) -> bool {
+        if ctx.input(|input| {
+            input.pointer.any_down()
+                || input
+                    .events
+                    .iter()
+                    .any(event_defers_automatic_background_load)
+        }) {
+            self.deferred_device_load.defer_background_for_user_input();
+        }
+        !(self.main_menu_tab == MainMenuTab::Settings
+            && self.settings_tab == SettingsTab::MatrixTester)
+            && !self.keycode_picker.open
+            && self.keycode_picker.result.is_none()
+            && self.editing_layer.is_none()
+            && self.pending_handed_swap.is_none()
+            && !self.pending_layout_undo
+            && !self.import_pending()
+            && !self.top_dropdown_open(ctx)
+            && !egui::Popup::is_any_open(ctx)
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -532,18 +663,29 @@ impl EntropyApp {
         {
             return;
         }
-        let Some(request) = self.deferred_request_for_current_view() else {
+        let allow_automatic_background_layer = self.automatic_background_layer_load_allowed(ctx);
+        let Some(request) =
+            self.deferred_request_for_current_view(allow_automatic_background_layer)
+        else {
             return;
         };
+        if request.is_background_layer() {
+            if let Some(delay) = self.deferred_device_load.background_layer_resume_delay() {
+                ctx.request_repaint_after(delay);
+                return;
+            }
+        }
 
         match self.start_vial_hid_operation(
             ctx,
             super::vial_hid_task::VialHidOperation::Deferred(request.clone()),
         ) {
             super::vial_hid_task::VialHidTaskStart::Started => {
-                if let Some(layer) = request.layer() {
-                    self.deferred_device_load
-                        .set_layer_status(layer, DeferredLoadStatus::Loading);
+                if !request.is_background_layer() {
+                    if let Some(layer) = request.layer() {
+                        self.deferred_device_load
+                            .set_layer_status(layer, DeferredLoadStatus::Loading);
+                    }
                 }
                 if let Some(section) = request.section() {
                     self.deferred_device_load
@@ -566,36 +708,32 @@ impl EntropyApp {
                 encoders,
                 firmware_name,
             } => {
-                if let Some(layout) = self.layout.as_mut() {
-                    if let Some(layer_keycodes) = layout.layers.get_mut(layer) {
-                        for (key_index, key) in layout.keys.iter().enumerate() {
-                            let matrix_index = key.row as usize * layout.cols + key.col as usize;
-                            if let Some(keycode) = keymap.get(matrix_index) {
-                                layer_keycodes[key_index] = *keycode;
-                            }
-                        }
+                self.deferred_device_load
+                    .clear_background_layer_progress(layer);
+                self.apply_deferred_layer(layer, keymap, encoders, firmware_name);
+            }
+            DeferredLoadPayload::BackgroundLayerStep { layer, result } => {
+                match self
+                    .deferred_device_load
+                    .record_background_layer_step(layer, result)
+                {
+                    Ok(Some(data)) => {
+                        self.apply_deferred_layer(
+                            data.layer,
+                            data.keymap,
+                            data.encoders,
+                            data.firmware_name,
+                        );
                     }
-                    if let Some(encoder_layer) = layout.encoder_layers.get_mut(layer) {
-                        for (visual_index, encoder) in layout.encoders.iter().enumerate() {
-                            if let Some((ccw, cw)) = encoders.get(encoder.encoder_idx as usize) {
-                                encoder_layer[visual_index] =
-                                    if encoder.direction == 0 { *ccw } else { *cw };
-                            }
-                        }
-                    }
-                    if let Some(name) = firmware_name.filter(|name| !name.trim().is_empty()) {
-                        if let Some(layer_name) = layout.layer_names.get_mut(layer) {
-                            *layer_name = name.clone();
-                        }
-                        if let Some(layer_name) = self.layer_names.get_mut(layer) {
-                            *layer_name = name;
-                        }
-                        self.keycode_picker.layer_names = self.layer_names.clone();
+                    Ok(None) => {}
+                    Err(error) => {
+                        log::warn!("Background Bluetooth layer assembly failed: {error}");
+                        self.deferred_device_load
+                            .clear_background_layer_progress(layer);
+                        self.deferred_device_load
+                            .set_layer_status(layer, DeferredLoadStatus::Failed(error));
                     }
                 }
-                self.deferred_device_load
-                    .set_layer_status(layer, DeferredLoadStatus::Loaded);
-                self.refresh_layer_picker_content_flags();
             }
             DeferredLoadPayload::Macros(texts) => {
                 self.keycode_picker.macro_count = texts.len();
@@ -676,6 +814,26 @@ impl EntropyApp {
                 self.deferred_device_load
                     .set_section_status(DeferredLoadSection::AltRepeat, DeferredLoadStatus::Loaded);
             }
+            DeferredLoadPayload::BehaviorSettings(settings) => {
+                self.combo_term = settings.combo_term.or(Some(50));
+                self.combo_term_dirty = false;
+                self.auto_shift_options = settings.auto_shift_options;
+                self.auto_shift_timeout = settings.auto_shift_timeout;
+                self.auto_shift_timeout_text = settings
+                    .auto_shift_timeout
+                    .map(|timeout| timeout.to_string())
+                    .unwrap_or_default();
+                self.mouse_keys_settings = settings.mouse_keys;
+                self.tap_hold_settings = settings.tap_hold;
+                self.magic_settings = settings.magic;
+                self.one_shot_settings = settings.one_shot;
+                self.grave_escape_settings = settings.grave_escape;
+                self.keycode_picker.supports_auto_shift = self.supported_qmk_settings.contains(&4);
+                self.deferred_device_load.set_section_status(
+                    DeferredLoadSection::BehaviorSettings,
+                    DeferredLoadStatus::Loaded,
+                );
+            }
             DeferredLoadPayload::Modules(settings) => {
                 self.module_settings = settings;
                 if let Some(layout) = self.layout.as_ref() {
@@ -723,12 +881,54 @@ impl EntropyApp {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
+    fn apply_deferred_layer(
+        &mut self,
+        layer: usize,
+        keymap: Vec<u16>,
+        encoders: Vec<(u16, u16)>,
+        firmware_name: Option<String>,
+    ) {
+        if let Some(layout) = self.layout.as_mut() {
+            if let Some(layer_keycodes) = layout.layers.get_mut(layer) {
+                for (key_index, key) in layout.keys.iter().enumerate() {
+                    let matrix_index = key.row as usize * layout.cols + key.col as usize;
+                    if let Some(keycode) = keymap.get(matrix_index) {
+                        layer_keycodes[key_index] = *keycode;
+                    }
+                }
+            }
+            if let Some(encoder_layer) = layout.encoder_layers.get_mut(layer) {
+                for (visual_index, encoder) in layout.encoders.iter().enumerate() {
+                    if let Some((ccw, cw)) = encoders.get(encoder.encoder_idx as usize) {
+                        encoder_layer[visual_index] =
+                            if encoder.direction == 0 { *ccw } else { *cw };
+                    }
+                }
+            }
+            if let Some(name) = firmware_name.filter(|name| !name.trim().is_empty()) {
+                if let Some(layer_name) = layout.layer_names.get_mut(layer) {
+                    *layer_name = name.clone();
+                }
+                if let Some(layer_name) = self.layer_names.get_mut(layer) {
+                    *layer_name = name;
+                }
+                self.keycode_picker.layer_names = self.layer_names.clone();
+            }
+        }
+        self.deferred_device_load
+            .set_layer_status(layer, DeferredLoadStatus::Loaded);
+        self.refresh_layer_picker_content_flags();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn fail_deferred_device_load(
         &mut self,
         request: &DeferredLoadRequest,
         error: String,
     ) {
         if let Some(layer) = request.layer() {
+            self.deferred_device_load
+                .clear_background_layer_progress(layer);
             self.deferred_device_load
                 .set_layer_status(layer, DeferredLoadStatus::Failed(error));
         } else if let Some(section) = request.section() {
@@ -818,6 +1018,21 @@ impl EntropyApp {
         if matches!(
             result
                 .deferred_load
+                .section_status(DeferredLoadSection::BehaviorSettings),
+            DeferredLoadStatus::Loaded
+        ) {
+            result.combo_term = self.combo_term;
+            result.auto_shift_options = self.auto_shift_options;
+            result.auto_shift_timeout = self.auto_shift_timeout;
+            result.mouse_keys_settings = self.mouse_keys_settings;
+            result.tap_hold_settings = self.tap_hold_settings;
+            result.magic_settings = self.magic_settings;
+            result.one_shot_settings = self.one_shot_settings;
+            result.grave_escape_settings = self.grave_escape_settings;
+        }
+        if matches!(
+            result
+                .deferred_load
                 .section_status(DeferredLoadSection::Modules),
             DeferredLoadStatus::Loaded
         ) {
@@ -884,7 +1099,11 @@ impl EntropyApp {
             return true;
         }
 
-        let Some(section) = settings_tab_deferred_section(self.settings_tab) else {
+        let Some(section) = settings_tab_deferred_sections(self.settings_tab)
+            .iter()
+            .copied()
+            .find(|section| !self.deferred_device_load.section_status(*section).ready())
+        else {
             return false;
         };
         let status = self.deferred_device_load.section_status(section);
@@ -1124,8 +1343,15 @@ mod tests {
             touchpad_supported: false,
             bluetooth_supported: true,
             layer_leds_supported: false,
+            rgb_supported: false,
             lighting_mode: None,
         }
+    }
+
+    fn context_with_behavior_settings() -> DeferredDeviceLoadContext {
+        let mut context = context();
+        context.supported_qmk_settings = std::sync::Arc::new(vec![2, 4, 21]);
+        context
     }
 
     #[test]
@@ -1141,6 +1367,44 @@ mod tests {
         assert_eq!(
             state.section_status(DeferredLoadSection::Modules),
             DeferredLoadStatus::NotNeeded
+        );
+    }
+
+    #[test]
+    fn staged_state_defers_behavior_values_when_the_schema_supports_them() {
+        let state = DeferredDeviceLoadState::staged(context_with_behavior_settings());
+
+        assert_eq!(
+            state.section_status(DeferredLoadSection::BehaviorSettings),
+            DeferredLoadStatus::NotLoaded
+        );
+    }
+
+    #[test]
+    fn staged_state_does_not_treat_none_lighting_as_rgb_support() {
+        let mut context = context();
+        context.lighting_mode = Some("none".to_owned());
+        context.rgb_supported = false;
+
+        let state = DeferredDeviceLoadState::staged(context);
+
+        assert_eq!(
+            state.section_status(DeferredLoadSection::Rgb),
+            DeferredLoadStatus::NotNeeded
+        );
+    }
+
+    #[test]
+    fn staged_state_defers_rgb_values_for_supported_lighting() {
+        let mut context = context();
+        context.lighting_mode = Some("qmk_rgblight".to_owned());
+        context.rgb_supported = true;
+
+        let state = DeferredDeviceLoadState::staged(context);
+
+        assert_eq!(
+            state.section_status(DeferredLoadSection::Rgb),
+            DeferredLoadStatus::NotLoaded
         );
     }
 
@@ -1261,5 +1525,292 @@ mod tests {
 
         assert!(crate::hid::is_disconnect_error(&error));
         assert_eq!(recorder.requests().len(), 1);
+    }
+
+    #[test]
+    fn deferred_behavior_reader_fetches_only_supported_values() {
+        let (hid, recorder) = crate::hid::HidDevice::test_device();
+        let request = DeferredLoadRequest::Section {
+            section: DeferredLoadSection::BehaviorSettings,
+            context: std::sync::Arc::new(context_with_behavior_settings()),
+        };
+
+        let payload = run_deferred_load(&hid, &request).unwrap();
+
+        assert!(matches!(
+            payload,
+            DeferredLoadPayload::BehaviorSettings(BehaviorSettingsState {
+                combo_term: Some(0),
+                auto_shift_timeout: Some(0),
+                magic: MagicSettingsState {
+                    supported: true,
+                    ..
+                },
+                ..
+            })
+        ));
+        let qsids = recorder
+            .requests()
+            .iter()
+            .filter(|request| request[..2] == [0xFE, 0x0A])
+            .map(|request| u16::from_le_bytes([request[2], request[3]]))
+            .collect::<Vec<_>>();
+        assert_eq!(qsids, vec![2, 4, 21]);
+    }
+
+    fn staged_app() -> EntropyApp {
+        let ctx = egui::Context::default();
+        let creation_context = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = EntropyApp::new(&creation_context);
+        app.deferred_device_load = DeferredDeviceLoadState::staged(context());
+        app.main_menu_tab = MainMenuTab::Keyboard;
+        app.selected_layer = 0;
+        app.keycode_picker.open = false;
+        app.keycode_picker.result = None;
+        app.app_settings.sticky_layout_window = false;
+        app
+    }
+
+    #[test]
+    fn automatic_background_load_selects_the_next_layer_on_the_keyboard_page() {
+        let app = staged_app();
+
+        let request = app.deferred_request_for_current_view(true).unwrap();
+
+        assert_eq!(request.layer(), Some(1));
+        assert!(request.is_background_layer());
+        assert!(!request.blocks_keyboard());
+    }
+
+    #[test]
+    fn open_top_dropdown_pauses_automatic_background_layers() {
+        let ctx = egui::Context::default();
+        let mut app = staged_app();
+        ctx.data_mut(|d| d.insert_temp(device_dropdown_open_id(), true));
+
+        assert!(!app.automatic_background_layer_load_allowed(&ctx));
+    }
+
+    #[test]
+    fn selected_unloaded_layer_preempts_the_automatic_background_order() {
+        let mut app = staged_app();
+        app.selected_layer = 3;
+
+        let request = app.deferred_request_for_current_view(true).unwrap();
+
+        assert_eq!(request.layer(), Some(3));
+        assert!(!request.is_background_layer());
+        assert!(request.blocks_keyboard());
+    }
+
+    #[test]
+    fn automatic_background_layer_is_split_at_every_hid_request_boundary() {
+        let mut context = context();
+        context.rows = 10;
+        context.cols = 6;
+        context.encoder_count = 2;
+        context.supported_qmk_settings = std::sync::Arc::new(vec![201]);
+        let mut state = DeferredDeviceLoadState::staged(context);
+        let expected_steps = [
+            BackgroundLayerStep::Keymap { local_offset: 0 },
+            BackgroundLayerStep::Keymap { local_offset: 28 },
+            BackgroundLayerStep::Keymap { local_offset: 56 },
+            BackgroundLayerStep::Keymap { local_offset: 84 },
+            BackgroundLayerStep::Keymap { local_offset: 112 },
+            BackgroundLayerStep::Encoder { encoder_index: 0 },
+            BackgroundLayerStep::Encoder { encoder_index: 1 },
+            BackgroundLayerStep::FirmwareName,
+        ];
+
+        for (index, expected_step) in expected_steps.into_iter().enumerate() {
+            let (layer, step) = state.next_background_layer_step().unwrap();
+            assert_eq!(layer, 1);
+            assert_eq!(step, expected_step);
+            let result = match step {
+                BackgroundLayerStep::Keymap { local_offset } => {
+                    let remaining = 120 - local_offset;
+                    BackgroundLayerStepResult::Keymap {
+                        local_offset,
+                        keycodes: vec![0; remaining.min(28) / 2],
+                    }
+                }
+                BackgroundLayerStep::Encoder { encoder_index } => {
+                    BackgroundLayerStepResult::Encoder {
+                        encoder_index,
+                        keycodes: (0, 0),
+                    }
+                }
+                BackgroundLayerStep::FirmwareName => {
+                    BackgroundLayerStepResult::FirmwareName(Some("Layer 1".to_owned()))
+                }
+            };
+            let completed = state.record_background_layer_step(layer, result).unwrap();
+            if index + 1 == expected_steps.len() {
+                let completed = completed.expect("last request completes the layer");
+                assert_eq!(completed.layer, 1);
+                assert_eq!(completed.keymap.len(), 60);
+                assert_eq!(completed.encoders.len(), 2);
+                assert_eq!(completed.firmware_name.as_deref(), Some("Layer 1"));
+            } else {
+                assert!(completed.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn foreground_layer_request_discards_partial_background_data() {
+        let mut context = context();
+        context.rows = 10;
+        context.cols = 6;
+        let mut state = DeferredDeviceLoadState::staged(context);
+
+        state
+            .record_background_layer_step(
+                1,
+                BackgroundLayerStepResult::Keymap {
+                    local_offset: 0,
+                    keycodes: vec![0; 14],
+                },
+            )
+            .unwrap();
+        state.set_layer_status(1, DeferredLoadStatus::Loading);
+        state.set_layer_status(1, DeferredLoadStatus::NotLoaded);
+
+        assert_eq!(
+            state.next_background_layer_step(),
+            Some((1, BackgroundLayerStep::Keymap { local_offset: 0 }))
+        );
+    }
+
+    #[test]
+    fn settings_page_behavior_values_preempt_background_layers() {
+        let mut app = staged_app();
+        app.deferred_device_load =
+            DeferredDeviceLoadState::staged(context_with_behavior_settings());
+        app.main_menu_tab = MainMenuTab::Advanced;
+        app.settings_tab = SettingsTab::AutoShift;
+
+        let request = app.deferred_request_for_current_view(true).unwrap();
+
+        assert_eq!(
+            request.section(),
+            Some(DeferredLoadSection::BehaviorSettings)
+        );
+        assert!(request.blocks_keyboard());
+    }
+
+    #[test]
+    fn combo_page_loads_entries_before_shared_behavior_values() {
+        let mut app = staged_app();
+        app.deferred_device_load =
+            DeferredDeviceLoadState::staged(context_with_behavior_settings());
+        app.main_menu_tab = MainMenuTab::Settings;
+        app.settings_tab = SettingsTab::Combo;
+
+        let entries_request = app.deferred_request_for_current_view(true).unwrap();
+        assert_eq!(entries_request.section(), Some(DeferredLoadSection::Combos));
+
+        app.deferred_device_load
+            .set_section_status(DeferredLoadSection::Combos, DeferredLoadStatus::Loaded);
+        let behavior_request = app.deferred_request_for_current_view(true).unwrap();
+        assert_eq!(
+            behavior_request.section(),
+            Some(DeferredLoadSection::BehaviorSettings)
+        );
+    }
+
+    #[test]
+    fn automatic_background_layers_leave_a_real_idle_gap_between_requests() {
+        let mut state = DeferredDeviceLoadState::default();
+
+        assert!(state.background_layer_resume_delay().is_none());
+        state.mark_background_layer_finished();
+        assert!(state.background_layer_resume_delay().is_some());
+        std::thread::sleep(std::time::Duration::from_millis(90));
+        assert!(state.background_layer_resume_delay().is_none());
+        state.mark_background_layer_finished();
+        assert!(state.background_layer_resume_delay().is_some());
+    }
+
+    #[test]
+    fn user_input_postpones_the_next_automatic_background_layer() {
+        let mut state = DeferredDeviceLoadState::default();
+
+        state.defer_background_for_user_input();
+
+        assert!(state
+            .background_layer_resume_delay()
+            .is_some_and(|delay| delay > std::time::Duration::from_millis(500)));
+    }
+
+    #[test]
+    fn background_completion_does_not_shorten_user_input_pause() {
+        let mut state = DeferredDeviceLoadState::default();
+
+        state.defer_background_for_user_input();
+        state.mark_background_layer_finished();
+
+        assert!(state
+            .background_layer_resume_delay()
+            .is_some_and(|delay| delay > std::time::Duration::from_millis(500)));
+    }
+
+    #[test]
+    fn passive_pointer_motion_does_not_defer_automatic_background_load() {
+        assert!(!event_defers_automatic_background_load(
+            &egui::Event::PointerMoved(egui::pos2(100.0, 100.0))
+        ));
+        assert!(!event_defers_automatic_background_load(
+            &egui::Event::WindowFocused(true)
+        ));
+    }
+
+    #[test]
+    fn deliberate_input_defers_automatic_background_load() {
+        assert!(event_defers_automatic_background_load(
+            &egui::Event::PointerButton {
+                pos: egui::pos2(100.0, 100.0),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }
+        ));
+        assert!(event_defers_automatic_background_load(
+            &egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, 10.0),
+                modifiers: egui::Modifiers::NONE,
+                phase: egui::TouchPhase::Move,
+            }
+        ));
+    }
+
+    #[test]
+    fn automatic_background_queue_loads_every_remaining_layer_in_order() {
+        let ctx = egui::Context::default();
+        let mut app = staged_app();
+        let (hid, recorder) = crate::hid::HidDevice::test_device();
+        app.hid_device = Some(hid);
+        // This test covers queue order rather than the separate initial-idle policy.
+        app.deferred_device_load
+            .allow_background_layer_now_for_test();
+
+        for _ in 0..500 {
+            app.poll_vial_hid_task(&ctx);
+            app.maybe_start_deferred_device_load(&ctx, false);
+            if app.deferred_device_load.all_layers_ready() && !app.vial_hid_task_active() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        assert!(app.deferred_device_load.all_layers_ready());
+        assert!(!app.vial_hid_task_active());
+        let offsets = recorder
+            .requests()
+            .iter()
+            .map(|request| u16::from_be_bytes([request[1], request[2]]))
+            .collect::<Vec<_>>();
+        assert_eq!(offsets, vec![12, 24, 36]);
     }
 }

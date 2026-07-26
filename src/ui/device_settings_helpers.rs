@@ -362,6 +362,209 @@ impl EntropyApp {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn read_behavior_settings(
+        supported_qmk_settings: &[u16],
+        dev_conn: &crate::hid::HidDevice,
+    ) -> BehaviorSettingsState {
+        let has_qmk_setting = |qsid: u16| supported_qmk_settings.contains(&qsid);
+
+        let combo_term = if has_qmk_setting(2) {
+            match dev_conn.get_qmk_setting_u16(2) {
+                Ok(value) => Some(value),
+                Err(e) => {
+                    log::warn!("get_qmk_setting_u16(combo_term): {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let auto_shift_options = if has_qmk_setting(3) {
+            match dev_conn.get_qmk_setting_u8(3) {
+                Ok(value) => AutoShiftOptionsState::from_bits(value),
+                Err(e) => {
+                    log::warn!("get_qmk_setting_u8(auto_shift_flags): {e}");
+                    AutoShiftOptionsState::default()
+                }
+            }
+        } else {
+            AutoShiftOptionsState::default()
+        };
+        let auto_shift_timeout = if has_qmk_setting(4) {
+            match dev_conn.get_qmk_setting_u16(4) {
+                Ok(value) => Some(value),
+                Err(e) => {
+                    log::warn!("get_qmk_setting_u16(auto_shift_timeout): {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let mouse_keys = {
+            let mut settings = MouseKeysSettingsState::default();
+            match has_qmk_setting(9).then(|| dev_conn.get_qmk_setting_u8(9)) {
+                Some(Ok(value)) => {
+                    settings.delay = value as u16;
+                    settings.supported = true;
+                    let read = |qsid: u16| -> u16 {
+                        if !has_qmk_setting(qsid) {
+                            return 0;
+                        }
+                        match dev_conn.get_qmk_setting_u8(qsid) {
+                            Ok(value) => value as u16,
+                            Err(e) => {
+                                log::warn!("get_qmk_setting_u8(mouse_keys qsid {qsid}): {e}");
+                                0
+                            }
+                        }
+                    };
+                    settings.interval = read(10);
+                    settings.move_delta = read(11);
+                    settings.max_speed = read(12);
+                    settings.time_to_max = read(13);
+                    settings.wheel_delay = read(14);
+                    settings.wheel_interval = read(15);
+                    settings.wheel_max_speed = read(16);
+                    settings.wheel_time_to_max = read(17);
+                }
+                Some(Err(e)) => {
+                    log::warn!("get_qmk_setting_u8(mouse_keys delay): {e}");
+                }
+                None => {}
+            }
+            settings
+        };
+
+        let tap_hold = {
+            let mut settings = TapHoldSettingsState::default();
+            match has_qmk_setting(7).then(|| dev_conn.get_qmk_setting_u16(7)) {
+                Some(Ok(value)) => {
+                    settings.tapping_term = value;
+                    settings.supported = true;
+                    for qsid in [7u16, 18, 19, 20, 22, 23, 24, 25, 26, 27] {
+                        if has_qmk_setting(qsid) {
+                            settings.set_qsid_supported(qsid);
+                        }
+                    }
+                    let read_bool = |qsid: u16| -> bool {
+                        if !has_qmk_setting(qsid) {
+                            return false;
+                        }
+                        match dev_conn.get_qmk_setting_u8(qsid) {
+                            Ok(value) => value != 0,
+                            Err(e) => {
+                                log::warn!("get_qmk_setting_u8(tap_hold qsid {qsid}): {e}");
+                                false
+                            }
+                        }
+                    };
+                    let read_u16 = |qsid: u16| -> u16 {
+                        if !has_qmk_setting(qsid) {
+                            return 0;
+                        }
+                        match dev_conn.get_qmk_setting_u16(qsid) {
+                            Ok(value) => value,
+                            Err(e) => {
+                                log::warn!("get_qmk_setting_u16(tap_hold qsid {qsid}): {e}");
+                                0
+                            }
+                        }
+                    };
+                    settings.permissive_hold = read_bool(22);
+                    settings.hold_on_other_key_press = read_bool(23);
+                    settings.retro_tapping = read_bool(24);
+                    settings.quick_tap_term = read_u16(25);
+                    settings.tap_code_delay = read_u16(18);
+                    settings.tap_hold_caps_delay = read_u16(19);
+                    settings.tapping_toggle = if has_qmk_setting(20) {
+                        dev_conn
+                            .get_qmk_setting_u8(20)
+                            .map(|value| value as u16)
+                            .unwrap_or_else(|e| {
+                                log::warn!("get_qmk_setting_u8(tap_hold qsid 20): {e}");
+                                0
+                            })
+                    } else {
+                        0
+                    };
+                    settings.chordal_hold = read_bool(26);
+                    settings.flow_tap = read_u16(27);
+                }
+                Some(Err(e)) => {
+                    log::warn!("get_qmk_setting_u16(tap_hold tapping_term): {e}");
+                }
+                None => {}
+            }
+            settings
+        };
+
+        let magic = match has_qmk_setting(21).then(|| dev_conn.get_qmk_setting_u16(21)) {
+            Some(Ok(bits)) => MagicSettingsState {
+                bits,
+                supported: true,
+            },
+            Some(Err(e)) => {
+                log::warn!("get_qmk_setting_u16(magic qsid 21): {e}");
+                MagicSettingsState::default()
+            }
+            None => MagicSettingsState::default(),
+        };
+
+        let one_shot = {
+            let mut settings = OneShotSettingsState::default();
+            if has_qmk_setting(5) {
+                match dev_conn.get_qmk_setting_u8(5) {
+                    Ok(value) => {
+                        settings.tap_toggle = value;
+                        settings.set_qsid_supported(5);
+                    }
+                    Err(e) => {
+                        log::warn!("get_qmk_setting_u8(one_shot tap toggle qsid 5): {e}");
+                    }
+                }
+            }
+            if has_qmk_setting(6) {
+                match dev_conn.get_qmk_setting_u16(6) {
+                    Ok(value) => {
+                        settings.timeout = value;
+                        settings.set_qsid_supported(6);
+                    }
+                    Err(e) => {
+                        log::warn!("get_qmk_setting_u16(one_shot timeout qsid 6): {e}");
+                    }
+                }
+            }
+            settings.supported = settings.supported_qsids != 0;
+            settings
+        };
+
+        let grave_escape = match has_qmk_setting(1).then(|| dev_conn.get_qmk_setting_u8(1)) {
+            Some(Ok(bits)) => GraveEscapeSettingsState {
+                bits,
+                supported: true,
+            },
+            Some(Err(e)) => {
+                log::warn!("get_qmk_setting_u8(grave_escape qsid 1): {e}");
+                GraveEscapeSettingsState::default()
+            }
+            None => GraveEscapeSettingsState::default(),
+        };
+
+        BehaviorSettingsState {
+            combo_term,
+            auto_shift_options,
+            auto_shift_timeout,
+            mouse_keys,
+            tap_hold,
+            magic,
+            one_shot,
+            grave_escape,
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn read_touchpad_settings(
         json: &serde_json::Value,
         supported_qmk_settings: &[u16],
@@ -1224,28 +1427,36 @@ impl EntropyApp {
         coalesced_side_groups
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
-    pub(super) fn read_module_settings(
+    pub(super) fn module_settings_from_definition(
         json: &serde_json::Value,
         supported_qmk_settings: &[u16],
-        dev_conn: &crate::hid::HidDevice,
     ) -> ModuleSettingsState {
         let groups = Self::module_settings_groups(json, supported_qmk_settings);
         let fields = groups
             .iter()
             .flat_map(|group| group.fields.iter().cloned())
             .collect::<Vec<_>>();
-        if fields.is_empty() {
-            return ModuleSettingsState::default();
-        }
-
-        let mut settings = ModuleSettingsState {
+        let supported = !fields.is_empty();
+        ModuleSettingsState {
             fields,
             groups,
             selected_module_group: 0,
             values: std::collections::BTreeMap::new(),
-            supported: true,
-        };
+            supported,
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn read_module_settings(
+        json: &serde_json::Value,
+        supported_qmk_settings: &[u16],
+        dev_conn: &crate::hid::HidDevice,
+    ) -> ModuleSettingsState {
+        let mut settings = Self::module_settings_from_definition(json, supported_qmk_settings);
+        if !settings.supported {
+            return settings;
+        }
+
         for (qsid, width) in Self::module_setting_widths(&settings.fields) {
             let value = if width > 1 {
                 dev_conn.get_qmk_setting_u16(qsid)
@@ -1262,17 +1473,54 @@ impl EntropyApp {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
+    fn qmk_hid_host_metadata_mode(layout: &KeyboardLayout) -> crate::qmk_hid_host::HostDataMode {
+        crate::qmk_hid_host::HostDataMode {
+            time: layout.live_features.time,
+            volume: layout.live_features.volume,
+            layout: layout.live_features.layout
+                || layout
+                    .custom_keycodes
+                    .iter()
+                    .any(|keycode| keycode.name.eq_ignore_ascii_case("LG_SYNC")),
+            media: layout.live_features.media,
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn add_qmk_hid_host_display_preset(mode: &mut crate::qmk_hid_host::HostDataMode, preset: &str) {
+        if !Self::display_preset_needs_entropy(preset) {
+            return;
+        }
+        let preset = preset.to_ascii_lowercase();
+        mode.time |= preset.contains("clock");
+        mode.volume |= preset.contains("volume");
+        mode.layout |= preset.contains("layout");
+        mode.media |= preset.contains("media");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn qmk_hid_host_supported_mode_for(
+        layout: &KeyboardLayout,
+    ) -> crate::qmk_hid_host::HostDataMode {
+        let mut mode = Self::qmk_hid_host_metadata_mode(layout);
+        for option in &layout.layout_options {
+            if Self::is_encoder_layout_option(option) || option.choices.is_empty() {
+                continue;
+            }
+            for choice in &option.choices {
+                Self::add_qmk_hid_host_display_preset(&mut mode, choice);
+            }
+        }
+        mode
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn qmk_hid_host_mode_for(
         layout: &KeyboardLayout,
         packed: Option<u32>,
     ) -> crate::qmk_hid_host::HostDataMode {
         let values = Self::unpack_layout_option_values(&layout.layout_options, packed.unwrap_or(0));
-        let mut mode = crate::qmk_hid_host::HostDataMode {
-            time: layout.live_features.time,
-            volume: layout.live_features.volume,
-            layout: layout.live_features.layout,
-            media: layout.live_features.media,
-        };
+        let mut mode = Self::qmk_hid_host_metadata_mode(layout);
         for (idx, option) in layout.layout_options.iter().enumerate() {
             if Self::is_encoder_layout_option(option) || option.choices.is_empty() {
                 continue;
@@ -1288,19 +1536,7 @@ impl EntropyApp {
                 .get(selected_idx)
                 .map(|s| s.as_str())
                 .unwrap_or("");
-            let selected_lower = selected.to_ascii_lowercase();
-            if Self::display_preset_needs_entropy(selected) && selected_lower.contains("clock") {
-                mode.time = true;
-            }
-            if Self::display_preset_needs_entropy(selected) && selected_lower.contains("volume") {
-                mode.volume = true;
-            }
-            if Self::display_preset_needs_entropy(selected) && selected_lower.contains("layout") {
-                mode.layout = true;
-            }
-            if Self::display_preset_needs_entropy(selected) && selected_lower.contains("media") {
-                mode.media = true;
-            }
+            Self::add_qmk_hid_host_display_preset(&mut mode, selected);
         }
         mode
     }
@@ -2020,6 +2256,48 @@ mod tests {
             label: "Hide encoder style".to_string(),
             choices: vec!["Compact".to_string(), "Full".to_string()],
         }));
+    }
+
+    #[test]
+    fn qmk_live_features_remain_available_with_a_static_display_preset() {
+        let mut layout = test_layout_with_encoders(&[]);
+        layout.layout_options = vec![LayoutOption {
+            label: "OLED Master".to_string(),
+            choices: vec![
+                "Status (classic)".to_string(),
+                "Clock & Volume (qmk-hid-host)".to_string(),
+                "Media (qmk-hid-host)".to_string(),
+                "Disabled".to_string(),
+            ],
+        }];
+
+        let active = EntropyApp::qmk_hid_host_mode_for(&layout, Some(0));
+        let supported = EntropyApp::qmk_hid_host_supported_mode_for(&layout);
+
+        assert!(active.is_empty());
+        assert!(supported.time);
+        assert!(supported.volume);
+        assert!(supported.media);
+        assert!(!supported.layout);
+    }
+
+    #[test]
+    fn qmk_ruen_keycodes_advertise_layout_sync_without_live_feature_metadata() {
+        let mut layout = test_layout_with_encoders(&[]);
+        layout.custom_keycodes = vec![crate::keyboard::CustomKeycode {
+            name: "LG_SYNC".to_string(),
+            label: "RuEn\nSync".to_string(),
+            title: "Sync language".to_string(),
+        }];
+
+        let active = EntropyApp::qmk_hid_host_mode_for(&layout, Some(0));
+        let supported = EntropyApp::qmk_hid_host_supported_mode_for(&layout);
+
+        assert!(active.layout);
+        assert!(supported.layout);
+        assert!(!active.time);
+        assert!(!active.volume);
+        assert!(!active.media);
     }
 
     #[test]
