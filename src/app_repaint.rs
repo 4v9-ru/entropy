@@ -6,43 +6,57 @@ const HIDDEN_TO_TRAY_REPAINT_INTERVAL: std::time::Duration = std::time::Duration
 const BLUETOOTH_VISIBLE_REPAINT_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(16);
 #[cfg(not(target_arch = "wasm32"))]
+const WAYLAND_BLUETOOTH_VISIBLE_REPAINT_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(50);
+#[cfg(not(target_arch = "wasm32"))]
 pub(super) const CONNECT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 #[cfg(not(target_arch = "wasm32"))]
 pub(super) const UPDATE_CHECK_POLL_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(100);
 
 #[cfg(not(target_arch = "wasm32"))]
-fn should_use_high_frequency_bluetooth_repaint_for_target(
+fn bluetooth_visible_repaint_interval_for_target(
     selected_device_is_bluetooth: bool,
-    target_is_windows: bool,
-) -> bool {
-    // A 16 ms timer keeps visible eframe windows rendering continuously on Windows.
-    selected_device_is_bluetooth && !target_is_windows
+    target_is_macos: bool,
+    target_is_wayland: bool,
+) -> Option<std::time::Duration> {
+    if !selected_device_is_bluetooth {
+        None
+    } else if target_is_macos {
+        Some(BLUETOOTH_VISIBLE_REPAINT_INTERVAL)
+    } else if target_is_wayland {
+        // On the tested Wayland stack, cursor motion does not reliably drive
+        // another eframe pass. A 20 FPS heartbeat keeps hover, tooltips, and
+        // hover-open menus live without restoring the saturating 60 FPS loop.
+        Some(WAYLAND_BLUETOOTH_VISIBLE_REPAINT_INTERVAL)
+    } else {
+        None
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub(super) fn should_use_high_frequency_bluetooth_repaint(
+pub(super) fn bluetooth_visible_repaint_interval(
     selected_device_is_bluetooth: bool,
-) -> bool {
-    should_use_high_frequency_bluetooth_repaint_for_target(
+    target_is_wayland: bool,
+) -> Option<std::time::Duration> {
+    bluetooth_visible_repaint_interval_for_target(
         selected_device_is_bluetooth,
-        cfg!(target_os = "windows"),
+        cfg!(target_os = "macos"),
+        target_is_wayland,
     )
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(super) fn native_repaint_interval(
     hidden_to_tray: bool,
-    high_frequency_bluetooth: bool,
+    bluetooth_visible_interval: Option<std::time::Duration>,
     connect_pending: bool,
     update_check_pending: bool,
 ) -> std::time::Duration {
     let baseline = if hidden_to_tray {
         HIDDEN_TO_TRAY_REPAINT_INTERVAL
-    } else if high_frequency_bluetooth {
-        BLUETOOTH_VISIBLE_REPAINT_INTERVAL
     } else {
-        VISIBLE_REPAINT_INTERVAL
+        bluetooth_visible_interval.unwrap_or(VISIBLE_REPAINT_INTERVAL)
     };
 
     let connect_interval = connect_pending.then_some(CONNECT_POLL_INTERVAL);
@@ -62,58 +76,88 @@ mod tests {
     #[test]
     fn native_repaint_cadence_uses_shortest_pending_interval() {
         assert_eq!(
-            native_repaint_interval(false, false, false, false),
+            native_repaint_interval(false, None, false, false),
             std::time::Duration::from_millis(250)
         );
         assert_eq!(
-            native_repaint_interval(false, true, false, false),
+            native_repaint_interval(
+                false,
+                Some(BLUETOOTH_VISIBLE_REPAINT_INTERVAL),
+                false,
+                false,
+            ),
             BLUETOOTH_VISIBLE_REPAINT_INTERVAL
         );
         assert_eq!(
-            native_repaint_interval(true, true, false, false),
+            native_repaint_interval(true, Some(BLUETOOTH_VISIBLE_REPAINT_INTERVAL), false, false,),
             std::time::Duration::from_secs(5)
         );
         assert_eq!(
-            native_repaint_interval(true, false, true, false),
+            native_repaint_interval(true, None, true, false),
             CONNECT_POLL_INTERVAL
         );
         assert_eq!(
-            native_repaint_interval(true, false, false, true),
+            native_repaint_interval(true, None, false, true),
             UPDATE_CHECK_POLL_INTERVAL
         );
         assert_eq!(
-            native_repaint_interval(true, false, true, true),
+            native_repaint_interval(true, None, true, true),
             UPDATE_CHECK_POLL_INTERVAL
         );
         assert_eq!(
-            native_repaint_interval(false, false, true, false),
+            native_repaint_interval(false, None, true, false),
             CONNECT_POLL_INTERVAL
         );
         assert_eq!(
-            native_repaint_interval(false, false, false, true),
+            native_repaint_interval(false, None, false, true),
             UPDATE_CHECK_POLL_INTERVAL
         );
         assert_eq!(
-            native_repaint_interval(false, false, true, true),
+            native_repaint_interval(false, None, true, true),
             UPDATE_CHECK_POLL_INTERVAL
         );
     }
 
     #[test]
-    fn windows_bluetooth_uses_normal_visible_idle_cadence() {
+    fn wayland_bluetooth_uses_a_bounded_visible_heartbeat() {
+        assert_eq!(
+            bluetooth_visible_repaint_interval_for_target(true, false, true),
+            Some(WAYLAND_BLUETOOTH_VISIBLE_REPAINT_INTERVAL)
+        );
         assert_eq!(
             native_repaint_interval(
                 false,
-                should_use_high_frequency_bluetooth_repaint_for_target(true, true),
+                bluetooth_visible_repaint_interval_for_target(true, false, true),
+                false,
+                false,
+            ),
+            WAYLAND_BLUETOOTH_VISIBLE_REPAINT_INTERVAL
+        );
+    }
+
+    #[test]
+    fn event_driven_platforms_keep_the_normal_visible_idle_cadence() {
+        assert_eq!(
+            bluetooth_visible_repaint_interval_for_target(true, false, false),
+            None
+        );
+        assert_eq!(
+            native_repaint_interval(
+                false,
+                bluetooth_visible_repaint_interval_for_target(true, false, false),
                 false,
                 false,
             ),
             VISIBLE_REPAINT_INTERVAL
         );
+    }
+
+    #[test]
+    fn macos_bluetooth_keeps_continuous_visible_cadence() {
         assert_eq!(
             native_repaint_interval(
                 false,
-                should_use_high_frequency_bluetooth_repaint_for_target(true, false),
+                bluetooth_visible_repaint_interval_for_target(true, true, false),
                 false,
                 false,
             ),

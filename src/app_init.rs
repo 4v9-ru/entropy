@@ -36,6 +36,12 @@ impl EntropyApp {
             #[cfg(not(target_arch = "wasm32"))]
             combo_write_task: None,
             settings_write_task: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            vial_hid_task: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            deferred_device_load: DeferredDeviceLoadState::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            deferred_full_layout_action: None,
             settings_write_queue: SettingsWriteQueueState::default(),
             settings_write_generation: 0,
             #[cfg(not(target_arch = "wasm32"))]
@@ -48,6 +54,8 @@ impl EntropyApp {
             layer_clipboard: None,
             scan_frame: 0,
             last_device_scan_at: 0.0,
+            #[cfg(not(target_arch = "wasm32"))]
+            next_battery_refresh_at: None,
             hover_layer: None,
             last_layout_geometry: None,
             prev_hovered_key: None,
@@ -160,7 +168,10 @@ impl EntropyApp {
             sticky_layout_prev_pressed: Vec::new(),
             sticky_layout_pressed_key_layers: Vec::new(),
             sticky_layout_toggled_layers: Vec::new(),
+            sticky_layout_active_combos: Vec::new(),
+            sticky_layout_tap_dance_states: Vec::new(),
             sticky_layout_base_layer: 0,
+            sticky_layout_active_layer: 0,
             sticky_layout_last_size: None,
             sticky_layout_resize_opacity_hold_frames: 0,
             pending_layout_indicator_open_after_unlock: false,
@@ -184,6 +195,7 @@ impl EntropyApp {
             tour_state: TourState::default(),
             tour_target_rects: Vec::new(),
             unlock_open: false,
+            vial_unlocked: None,
             vial_unlock_keys: vec![],
             vial_unlock_polling: false,
             vial_unlock_counter: 0,
@@ -212,25 +224,10 @@ impl EntropyApp {
 
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn is_vial_locked(&self) -> bool {
-        if self
-            .hid_device
-            .as_ref()
-            .map(|hid| hid.is_bluetooth_transport())
-            .unwrap_or(false)
-        {
-            return false;
-        }
-
         self.firmware == FirmwareProtocol::Vial
             && self.layout.is_some()
             && !self.vial_unlock_polling
-            && self
-                .hid_device
-                .as_ref()
-                .and_then(|hid| hid.get_unlock_status().ok())
-                .map(|(unlocked, _)| unlocked)
-                .map(|unlocked| !unlocked)
-                .unwrap_or(false)
+            && self.vial_unlocked != Some(true)
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -265,6 +262,7 @@ impl EntropyApp {
         if let Some(hid) = &self.hid_device {
             match hid.lock() {
                 Ok(()) => {
+                    self.vial_unlocked = Some(false);
                     self.status_msg = crate::i18n::tr_catalog(
                         self.app_settings.language,
                         "status_messages.device_unlock_cancelled",

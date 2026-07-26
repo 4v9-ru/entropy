@@ -4,7 +4,6 @@ mod app;
 pub(crate) mod app_icon;
 mod device;
 mod diagnostics;
-mod emoji_catalog;
 mod firmware;
 #[cfg(not(target_arch = "wasm32"))]
 mod hid;
@@ -14,6 +13,8 @@ mod keycode;
 mod keycode_picker;
 #[cfg(test)]
 mod layouts;
+#[cfg(target_os = "linux")]
+mod linux_ble;
 #[cfg(target_os = "linux")]
 mod linux_setup;
 #[cfg(not(target_arch = "wasm32"))]
@@ -328,7 +329,7 @@ fn main() -> eframe::Result<()> {
             );
             fonts.font_data.insert(
                 "noto_emoji".to_owned(),
-                egui::FontData::from_static(include_bytes!("../assets/NotoEmoji-Regular.ttf"))
+                egui::FontData::from_static(include_bytes!("../assets/NotoEmoji-subset.ttf"))
                     .into(),
             );
             let prop = fonts
@@ -346,14 +347,6 @@ fn main() -> eframe::Result<()> {
             mono.push("dejavu".to_owned());
             mono.push("noto_symbols".to_owned());
             mono.push("noto_emoji".to_owned());
-            fonts.families.insert(
-                egui::FontFamily::Name("emoji_preview".into()),
-                vec![
-                    "noto_emoji".to_owned(),
-                    "noto_symbols".to_owned(),
-                    "dejavu".to_owned(),
-                ],
-            );
             cc.egui_ctx.set_fonts(fonts);
             Ok(Box::new(EntropyApp::new(cc)))
         }),

@@ -1,5 +1,32 @@
 use super::*;
 
+pub(super) const MAIN_MENU_BATTERY_RESERVED_H: f32 = 34.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MainMenuBatteryStatus {
+    None,
+    Single(u8),
+    Split { left: u8, right: u8 },
+}
+
+fn main_menu_battery_status(battery: Option<crate::hid::BatteryHalves>) -> MainMenuBatteryStatus {
+    match battery {
+        Some(crate::hid::BatteryHalves {
+            left: Some(left),
+            right: Some(right),
+        }) => MainMenuBatteryStatus::Split { left, right },
+        Some(crate::hid::BatteryHalves {
+            left: Some(value),
+            right: None,
+        })
+        | Some(crate::hid::BatteryHalves {
+            left: None,
+            right: Some(value),
+        }) => MainMenuBatteryStatus::Single(value),
+        _ => MainMenuBatteryStatus::None,
+    }
+}
+
 fn layer_after_wheel(selected: usize, layer_count: usize, wheel_delta: f32) -> usize {
     if layer_count == 0 {
         return 0;
@@ -14,6 +41,72 @@ fn layer_after_wheel(selected: usize, layer_count: usize, wheel_delta: f32) -> u
 }
 
 impl EntropyApp {
+    fn main_menu_battery_status(&self) -> MainMenuBatteryStatus {
+        main_menu_battery_status(
+            self.device_about_info
+                .as_ref()
+                .and_then(|info| info.battery_halves),
+        )
+    }
+
+    pub(super) fn main_menu_has_battery_status(&self) -> bool {
+        self.main_menu_battery_status() != MainMenuBatteryStatus::None
+    }
+
+    fn draw_main_menu_battery_status(&self, ui: &mut egui::Ui, center_x: f32, layer_center_y: f32) {
+        let status = self.main_menu_battery_status();
+        if status == MainMenuBatteryStatus::None {
+            return;
+        }
+
+        let lang = self.app_settings.language;
+        let text_color = app_muted_text(self.dark_mode);
+        let font = FontId::proportional(13.0);
+        let center_y = layer_center_y + 42.0;
+        let paint_value = |x: f32, value: u8| {
+            let painter = ui.painter();
+            let value_text = about_device_ui::battery_percent_text(lang, Some(value));
+            let galley = painter.layout_no_wrap(value_text, font.clone(), text_color);
+            let icon_gap = 5.0;
+            let content_width = crate::ui_style::BATTERY_ICON_WIDTH + icon_gap + galley.size().x;
+            let content_left = x - content_width * 0.5;
+            crate::ui_style::paint_battery_icon(
+                painter,
+                egui::pos2(
+                    content_left + crate::ui_style::BATTERY_ICON_WIDTH * 0.5,
+                    center_y,
+                ),
+                value,
+                text_color,
+            );
+            painter.galley(
+                egui::pos2(
+                    content_left + crate::ui_style::BATTERY_ICON_WIDTH + icon_gap,
+                    center_y - galley.size().y * 0.5,
+                ),
+                galley,
+                text_color,
+            );
+        };
+
+        match status {
+            MainMenuBatteryStatus::None => {}
+            MainMenuBatteryStatus::Single(value) => paint_value(center_x, value),
+            MainMenuBatteryStatus::Split { left, right } => {
+                let value_offset = 44.0;
+                paint_value(center_x - value_offset, left);
+                paint_value(center_x + value_offset, right);
+                ui.painter().line_segment(
+                    [
+                        egui::pos2(center_x, center_y - 8.0),
+                        egui::pos2(center_x, center_y + 8.0),
+                    ],
+                    top_menu_divider_stroke(self.dark_mode),
+                );
+            }
+        }
+    }
+
     pub(super) fn draw_layout_layer_switcher_and_hints(
         &mut self,
         ui: &mut egui::Ui,
@@ -41,6 +134,7 @@ impl EntropyApp {
             let name = display_name;
             let center_x = ui.max_rect().center().x;
             let bar_y = top_base_y + main_tabs_h + 24.0;
+            let mid_y = bar_y + layer_bar_h / 2.0;
             // Layer name / edit field
             let name_rect = egui::Rect::from_min_size(
                 egui::pos2(center_x - 85.0, bar_y),
@@ -131,8 +225,6 @@ impl EntropyApp {
                     self.editing_layer_focus_requested = false;
                 }
             } else {
-                let mid_y = bar_y + layer_bar_h / 2.0;
-
                 // Fixed arrow positions based on max 7-char name width so
                 // arrows never jump around as the layer name changes.
                 // name_rect is 170px wide → half = 85px; gap keeps arrows clear.
@@ -263,13 +355,49 @@ impl EntropyApp {
 
                 self.draw_layout_bottom_hints(ui, center_x, name_r.hovered());
             }
+
+            self.draw_main_menu_battery_status(ui, center_x, mid_y);
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::layer_after_wheel;
+    use super::{layer_after_wheel, main_menu_battery_status, MainMenuBatteryStatus};
+
+    #[test]
+    fn split_batteries_keep_left_and_right_order() {
+        assert_eq!(
+            main_menu_battery_status(Some(crate::hid::BatteryHalves {
+                left: Some(98),
+                right: Some(95),
+            })),
+            MainMenuBatteryStatus::Split {
+                left: 98,
+                right: 95,
+            }
+        );
+    }
+
+    #[test]
+    fn one_reported_battery_is_centered() {
+        assert_eq!(
+            main_menu_battery_status(Some(crate::hid::BatteryHalves {
+                left: None,
+                right: Some(95),
+            })),
+            MainMenuBatteryStatus::Single(95)
+        );
+    }
+
+    #[test]
+    fn missing_battery_values_hide_the_main_menu_status() {
+        assert_eq!(
+            main_menu_battery_status(Some(crate::hid::BatteryHalves::default())),
+            MainMenuBatteryStatus::None
+        );
+        assert_eq!(main_menu_battery_status(None), MainMenuBatteryStatus::None);
+    }
 
     #[test]
     fn wheel_event_moves_exactly_one_layer_without_wrapping() {

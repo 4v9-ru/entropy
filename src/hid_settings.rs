@@ -37,17 +37,11 @@ fn truncate_qmk_string_payload(value: &str, max_decoded: usize, max_escaped: usi
 
 use anyhow::Result;
 
-fn verify_qmk_setting_writeback(qsid: u16, requested: u16, readback: u16) -> Result<()> {
-    if readback == requested {
-        return Ok(());
-    }
-
-    anyhow::bail!(
-        "qmk setting writeback mismatch for qsid {}: wrote {}, read back {}",
-        qsid,
-        requested,
-        readback
-    )
+fn qmk_setting_set_succeeded(command: &[u8; MSG_LEN], response: &[u8; MSG_LEN]) -> bool {
+    // Vial/QMK returns a status byte. RMK built-in behavior settings echo the
+    // complete SET report, while RMK device settings replace only byte zero
+    // with the success status.
+    response[0] == 0 || response == command
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -206,16 +200,10 @@ impl HidDevice {
         cmd[2..4].copy_from_slice(&qsid.to_le_bytes());
         cmd[4] = value;
         let resp = self.usb_send(&cmd)?;
-        if resp[0] != 0 {
+        if !qmk_setting_set_succeeded(&cmd, &resp) {
             anyhow::bail!("qmk setting set error or unsupported qsid: {qsid}");
         }
         Ok(())
-    }
-
-    pub fn set_qmk_setting_u8_verified(&self, qsid: u16, value: u8) -> Result<()> {
-        self.set_qmk_setting_u8(qsid, value)?;
-        let readback = self.get_qmk_setting_u8(qsid)?;
-        verify_qmk_setting_writeback(qsid, value as u16, readback as u16)
     }
 
     pub fn get_qmk_setting_u16(&self, qsid: u16) -> Result<u16> {
@@ -237,16 +225,10 @@ impl HidDevice {
         cmd[2..4].copy_from_slice(&qsid.to_le_bytes());
         cmd[4..6].copy_from_slice(&value.to_le_bytes());
         let resp = self.usb_send(&cmd)?;
-        if resp[0] != 0 {
+        if !qmk_setting_set_succeeded(&cmd, &resp) {
             anyhow::bail!("qmk setting set error or unsupported qsid: {qsid}");
         }
         Ok(())
-    }
-
-    pub fn set_qmk_setting_u16_verified(&self, qsid: u16, value: u16) -> Result<()> {
-        self.set_qmk_setting_u16(qsid, value)?;
-        let readback = self.get_qmk_setting_u16(qsid)?;
-        verify_qmk_setting_writeback(qsid, value, readback)
     }
 
     pub fn get_qmk_setting_string(&self, qsid: u16) -> Result<String> {
@@ -280,7 +262,7 @@ impl HidDevice {
         cmd[4 + payload.len()] = 0;
 
         let resp = self.usb_send(&cmd)?;
-        if resp[0] != 0 {
+        if !qmk_setting_set_succeeded(&cmd, &resp) {
             anyhow::bail!("qmk setting set error or unsupported qsid: {qsid}");
         }
         Ok(())
@@ -416,6 +398,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn accepts_vial_status_and_rmk_echo_setting_set_responses() {
+        let mut command = [0u8; MSG_LEN];
+        command[0] = CMD_VIA_VIAL_PREFIX;
+        command[1] = CMD_VIAL_QMK_SETTINGS_SET;
+        command[2..4].copy_from_slice(&7u16.to_le_bytes());
+        command[4..6].copy_from_slice(&175u16.to_le_bytes());
+
+        let vial_success = [0u8; MSG_LEN];
+        let mut rmk_device_setting_success = command;
+        rmk_device_setting_success[0] = 0;
+        let rmk_builtin_success = command;
+
+        assert!(qmk_setting_set_succeeded(&command, &vial_success));
+        assert!(qmk_setting_set_succeeded(
+            &command,
+            &rmk_device_setting_success
+        ));
+        assert!(qmk_setting_set_succeeded(&command, &rmk_builtin_success));
+    }
+
+    #[test]
+    fn rejects_qmk_setting_set_error_response() {
+        let mut command = [0u8; MSG_LEN];
+        command[0] = CMD_VIA_VIAL_PREFIX;
+        command[1] = CMD_VIAL_QMK_SETTINGS_SET;
+        command[2..4].copy_from_slice(&7u16.to_le_bytes());
+
+        let mut error = [0u8; MSG_LEN];
+        error[0] = u8::MAX;
+
+        assert!(!qmk_setting_set_succeeded(&command, &error));
+    }
+
+    #[test]
     fn truncate_short_ascii_is_unchanged() {
         assert_eq!(truncate_qmk_string_payload("BASE", 15, 27), b"BASE");
     }
@@ -470,19 +486,6 @@ mod tests {
         let out = truncate_qmk_string_payload("МАКРОСЛОЙ", QMK_STRING_MAX_DECODED_BYTES, 27);
         assert!(out.len() <= QMK_STRING_MAX_DECODED_BYTES);
         assert!(std::str::from_utf8(&out).is_ok());
-    }
-
-    #[test]
-    fn qmk_setting_writeback_accepts_matching_value() {
-        assert!(verify_qmk_setting_writeback(7, 150, 150).is_ok());
-    }
-
-    #[test]
-    fn qmk_setting_writeback_rejects_stale_value() {
-        let error = verify_qmk_setting_writeback(7, 150, 250).unwrap_err();
-
-        assert!(error.to_string().contains("qmk setting writeback mismatch"));
-        assert!(error.to_string().contains("qsid 7"));
     }
 
     #[test]

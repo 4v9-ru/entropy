@@ -655,7 +655,6 @@ fn static_catalog_key(text: &str) -> Option<&'static str> {
         "↩ Undo" => Some("key_picker_text.undo_undo"),
         "Undo last change" => Some("key_picker_text.undo_last_change"),
         "Remove all actions from this macro" => Some("key_picker_text.remove_all_actions_from_this_macro"),
-        "Select a tap dance tab above to edit" => Some("key_picker_text.select_a_tap_dance_tab_above_to_edit"),
         "Key sent on single tap" => Some("key_picker_text.key_sent_on_single_tap"),
         "Key sent when held" => Some("key_picker_text.key_sent_when_held"),
         "Key sent on double tap" => Some("key_picker_text.key_sent_on_double_tap"),
@@ -724,7 +723,6 @@ fn static_catalog_key(text: &str) -> Option<&'static str> {
         "Tapping term is in milliseconds" => Some("tap_dance_editor.tapping_term_is_in_milliseconds"),
         "Clear all actions for this tap dance" => Some("tap_dance_editor.clear_all_actions_for_this_tap_dance"),
         "Undo last tap dance change" => Some("tap_dance_editor.undo_last_tap_dance_change"),
-        "Tap Dance Editor" => Some("tap_dance_editor.tap_dance_editor"),
         "Device is locked, unlock it to use Matrix Tester" => Some("matrix_tester.keyboard_is_locked_unlock_it_to_use_matrix_tester"),
         "Click to reset Matrix Tester" => Some("matrix_tester.click_to_reset_matrix_tester"),
         "Matrix Tester is currently available only for Vial devices" => Some("matrix_tester.matrix_tester_is_currently_available_only_for_vial_keyboards"),
@@ -943,7 +941,6 @@ fn exact_text_catalog_key(text: &str) -> Option<&'static str> {
         "Restart Entropy after changing permissions" => Some("universal_symbols_setup.restart_entropy_after_changing_permissions"),
         "X11: install xdotool and keep Entropy running" => Some("universal_symbols_setup.x11_install_xdotool_and_keep_entropy_running"),
         "Wayland + IBus: install Entropy Universal Symbols and select it as an input source" => Some("universal_symbols_setup.wayland_plus_ibus_install_entropy_universal_symbols_and_select_it_as_a"),
-        "Wayland + Fcitx5: install the addon, restart Fcitx5, and enable Entropy Universal Symbols" => Some("universal_symbols_setup.wayland_plus_fcitx5_install_the_addon_restart_fcitx5_and_enable_entrop"),
         "Universal Symbols are not supported on this OS yet" => Some("universal_symbols_setup.universal_symbols_are_not_supported_on_this_os_yet"),
         "Open Config → Universal Symbols to finish permissions setup" => Some("universal_symbols_setup.open_config_to_universal_symbols_to_finish_permissions_setup"),
         "Open Config → Universal Symbols to finish Linux setup" => Some("universal_symbols_setup.open_config_to_universal_symbols_to_finish_linux_setup"),
@@ -1263,6 +1260,18 @@ pub fn tr_text(language: Language, text: &str) -> String {
     match text {
         "Device not found" => tr_catalog_string(language, "dynamic_status.device_not_found"),
         "Connect thread died" => tr_catalog_string(language, "dynamic_status.connect_thread_died"),
+        other
+            if other
+                == format!(
+                    "Open failed: {}",
+                    crate::hid::MACOS_HID_INPUT_MONITORING_REQUIRED
+                ) =>
+        {
+            tr_catalog_string(
+                language,
+                "dynamic_status.macos_hid_input_monitoring_required",
+            )
+        }
         "✓ Saved" => tr_catalog_string(language, "dynamic_status.saved_check"),
         "Device locked" => tr_catalog_string(language, "dynamic_status.device_locked"),
         "Entropy refreshed from a repeated launch" => {
@@ -2002,27 +2011,21 @@ pub fn tr_text(language: Language, text: &str) -> String {
                 "hold Shift for",
                 tr_catalog(language, "dynamic_tooltips.hold_shift_for"),
             ),
-        other
-            if other
-                .starts_with("Universal output backend: Wayland via IBus/Fcitx5 input method") =>
-        {
+        other if other.starts_with("Universal output backend: Wayland via IBus input method") => {
             other.replacen(
-                "Universal output backend: Wayland via IBus/Fcitx5 input method",
-                tr_catalog(language, "dynamic_tooltips.backend_wayland_ibus_fcitx5"),
+                "Universal output backend: Wayland via IBus input method",
+                tr_catalog(language, "dynamic_tooltips.backend_wayland_ibus"),
                 1,
             )
         }
         other if other.starts_with("Universal output backend: Linux X11 native") => other.replacen(
-            "Universal output backend: Linux X11 native; Wayland uses IBus/Fcitx5",
+            "Universal output backend: Linux X11 native; Wayland uses IBus",
             tr_catalog(language, "dynamic_tooltips.backend_linux_x11_native"),
             1,
         ),
-        other
-            if other
-                .starts_with("Universal output backend: Linux; use IBus/Fcitx5 for Wayland") =>
-        {
+        other if other.starts_with("Universal output backend: Linux; use IBus for Wayland") => {
             other.replacen(
-                "Universal output backend: Linux; use IBus/Fcitx5 for Wayland",
+                "Universal output backend: Linux; use IBus for Wayland",
                 tr_catalog(language, "dynamic_tooltips.backend_linux_wayland_hint"),
                 1,
             )

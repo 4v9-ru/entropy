@@ -7,6 +7,8 @@ pub(crate) static TRAY_RESTORE_REQUESTED: std::sync::atomic::AtomicBool =
 
 pub(crate) const MATRIX_TESTER_POLL_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(16);
+pub(crate) const MATRIX_TESTER_BLUETOOTH_POLL_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(80);
 pub(crate) const MATRIX_TESTER_LOCK_CHECK_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(750);
 pub(crate) const UI_SCALE_MIN: f32 = 0.5;
@@ -288,6 +290,7 @@ pub(crate) struct DeviceAboutInfo {
     pub(crate) product_id: u16,
     pub(crate) path: String,
     pub(crate) firmware_version: Option<String>,
+    pub(crate) supports_battery_halves: bool,
     pub(crate) battery_halves: Option<crate::hid::BatteryHalves>,
     pub(crate) via_protocol: u16,
     pub(crate) vial_protocol: u32,
@@ -306,12 +309,261 @@ pub(crate) struct DeviceAboutInfo {
     pub(crate) qmk_settings: bool,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum DeferredLoadSection {
+    Macros,
+    Combos,
+    TapDance,
+    KeyOverrides,
+    AltRepeat,
+    Modules,
+    Touchpad,
+    Bluetooth,
+    LayerLeds,
+    Rgb,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeferredFullLayoutAction {
+    ImportEntlayout,
+    ExportEntlayout,
+    OpenImageExport,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl DeferredLoadSection {
+    pub(crate) const ALL: [Self; 10] = [
+        Self::Macros,
+        Self::Combos,
+        Self::TapDance,
+        Self::KeyOverrides,
+        Self::AltRepeat,
+        Self::Modules,
+        Self::Touchpad,
+        Self::Bluetooth,
+        Self::LayerLeds,
+        Self::Rgb,
+    ];
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) enum DeferredLoadStatus {
+    #[default]
+    NotLoaded,
+    Loading,
+    Loaded,
+    NotNeeded,
+    Failed(String),
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl DeferredLoadStatus {
+    pub(crate) fn ready(&self) -> bool {
+        matches!(self, Self::Loaded | Self::NotNeeded)
+    }
+}
+
+/// Immutable metadata needed to finish a staged Bluetooth load through the
+/// existing serialized HID owner. Mutable device values deliberately live in
+/// EntropyApp, not in this context.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone)]
+pub(crate) struct DeferredDeviceLoadContext {
+    pub(crate) json: std::sync::Arc<serde_json::Value>,
+    pub(crate) supported_qmk_settings: std::sync::Arc<Vec<u16>>,
+    pub(crate) definition_fingerprint: u64,
+    pub(crate) layer_count: usize,
+    pub(crate) rows: usize,
+    pub(crate) cols: usize,
+    pub(crate) encoder_count: usize,
+    pub(crate) macro_count: u8,
+    pub(crate) macro_memory_bytes: Option<u16>,
+    pub(crate) tap_dance_count: u8,
+    pub(crate) combo_count: u8,
+    pub(crate) key_override_count: u8,
+    pub(crate) alt_repeat_count: u8,
+    pub(crate) modules_supported: bool,
+    pub(crate) touchpad_supported: bool,
+    pub(crate) bluetooth_supported: bool,
+    pub(crate) layer_leds_supported: bool,
+    pub(crate) lighting_mode: Option<String>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl DeferredDeviceLoadContext {
+    pub(crate) fn supports_section(&self, section: DeferredLoadSection) -> bool {
+        match section {
+            DeferredLoadSection::Macros => self.macro_count > 0,
+            DeferredLoadSection::Combos => self.combo_count > 0,
+            DeferredLoadSection::TapDance => self.tap_dance_count > 0,
+            DeferredLoadSection::KeyOverrides => self.key_override_count > 0,
+            DeferredLoadSection::AltRepeat => self.alt_repeat_count > 0,
+            DeferredLoadSection::Modules => self.modules_supported,
+            DeferredLoadSection::Touchpad => self.touchpad_supported,
+            DeferredLoadSection::Bluetooth => self.bluetooth_supported,
+            DeferredLoadSection::LayerLeds => self.layer_leds_supported,
+            DeferredLoadSection::Rgb => self.lighting_mode.is_some(),
+        }
+    }
+
+    fn compatible_with(&self, other: &Self) -> bool {
+        self.definition_fingerprint == other.definition_fingerprint
+            && self.layer_count == other.layer_count
+            && self.rows == other.rows
+            && self.cols == other.cols
+            && self.encoder_count == other.encoder_count
+            && self.macro_count == other.macro_count
+            && self.macro_memory_bytes == other.macro_memory_bytes
+            && self.tap_dance_count == other.tap_dance_count
+            && self.combo_count == other.combo_count
+            && self.key_override_count == other.key_override_count
+            && self.alt_repeat_count == other.alt_repeat_count
+            && self.supported_qmk_settings == other.supported_qmk_settings
+            && self.modules_supported == other.modules_supported
+            && self.touchpad_supported == other.touchpad_supported
+            && self.bluetooth_supported == other.bluetooth_supported
+            && self.layer_leds_supported == other.layer_leds_supported
+            && self.lighting_mode == other.lighting_mode
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Default)]
+pub(crate) struct DeferredDeviceLoadState {
+    pub(crate) context: Option<std::sync::Arc<DeferredDeviceLoadContext>>,
+    section_statuses: std::collections::BTreeMap<DeferredLoadSection, DeferredLoadStatus>,
+    layer_statuses: Vec<DeferredLoadStatus>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl DeferredDeviceLoadState {
+    pub(crate) fn staged(context: DeferredDeviceLoadContext) -> Self {
+        let context = std::sync::Arc::new(context);
+        let section_statuses = DeferredLoadSection::ALL
+            .into_iter()
+            .map(|section| {
+                let status = if context.supports_section(section) {
+                    DeferredLoadStatus::NotLoaded
+                } else {
+                    DeferredLoadStatus::NotNeeded
+                };
+                (section, status)
+            })
+            .collect();
+        let mut layer_statuses = vec![DeferredLoadStatus::NotLoaded; context.layer_count.max(1)];
+        layer_statuses[0] = DeferredLoadStatus::Loaded;
+        Self {
+            context: Some(context),
+            section_statuses,
+            layer_statuses,
+        }
+    }
+
+    pub(crate) fn complete(layer_count: usize) -> Self {
+        Self {
+            context: None,
+            section_statuses: DeferredLoadSection::ALL
+                .into_iter()
+                .map(|section| (section, DeferredLoadStatus::Loaded))
+                .collect(),
+            layer_statuses: vec![DeferredLoadStatus::Loaded; layer_count.max(1)],
+        }
+    }
+
+    pub(crate) fn is_staged(&self) -> bool {
+        self.context.is_some()
+    }
+
+    pub(crate) fn section_status(&self, section: DeferredLoadSection) -> DeferredLoadStatus {
+        self.section_statuses
+            .get(&section)
+            .cloned()
+            .unwrap_or(DeferredLoadStatus::Loaded)
+    }
+
+    pub(crate) fn set_section_status(
+        &mut self,
+        section: DeferredLoadSection,
+        status: DeferredLoadStatus,
+    ) {
+        self.section_statuses.insert(section, status);
+    }
+
+    pub(crate) fn section_supported(&self, section: DeferredLoadSection) -> bool {
+        self.context
+            .as_ref()
+            .map(|context| context.supports_section(section))
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn layer_status(&self, layer: usize) -> DeferredLoadStatus {
+        self.layer_statuses
+            .get(layer)
+            .cloned()
+            .unwrap_or(DeferredLoadStatus::Loaded)
+    }
+
+    pub(crate) fn set_layer_status(&mut self, layer: usize, status: DeferredLoadStatus) {
+        if let Some(current) = self.layer_statuses.get_mut(layer) {
+            *current = status;
+        }
+    }
+
+    pub(crate) fn next_unloaded_layer(&self) -> Option<usize> {
+        self.layer_statuses
+            .iter()
+            .position(|status| matches!(status, DeferredLoadStatus::NotLoaded))
+    }
+
+    pub(crate) fn first_incomplete_layer(&self) -> Option<(usize, DeferredLoadStatus)> {
+        self.layer_statuses
+            .iter()
+            .enumerate()
+            .find(|(_, status)| !status.ready())
+            .map(|(layer, status)| (layer, status.clone()))
+    }
+
+    pub(crate) fn all_layers_ready(&self) -> bool {
+        self.layer_statuses.iter().all(DeferredLoadStatus::ready)
+    }
+
+    pub(crate) fn merge_loaded_from(&mut self, previous: &Self) {
+        let compatible = self
+            .context
+            .as_ref()
+            .zip(previous.context.as_ref())
+            .map(|(current, previous)| current.compatible_with(previous))
+            .unwrap_or(false);
+        if !compatible {
+            return;
+        }
+
+        for section in DeferredLoadSection::ALL {
+            if matches!(previous.section_status(section), DeferredLoadStatus::Loaded)
+                && self.section_supported(section)
+            {
+                self.set_section_status(section, DeferredLoadStatus::Loaded);
+            }
+        }
+        for layer in 0..self.layer_statuses.len() {
+            if matches!(previous.layer_status(layer), DeferredLoadStatus::Loaded) {
+                self.set_layer_status(layer, DeferredLoadStatus::Loaded);
+            }
+        }
+    }
+}
+
 /// Result sent back from the background connect thread.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) struct ConnectResult {
     pub(crate) device_name: String,
     /// Stable Vial keyboard definition id used for per-keyboard local settings.
     pub(crate) keyboard_id: u64,
+    /// Lock state and physical unlock keys reported by Vial during connect.
+    pub(crate) vial_unlock_status: Option<(bool, Vec<(u8, u8)>)>,
     /// Open HID connection used during loading; kept for live writes just like vial-gui.
     pub(crate) hid_device: Option<crate::hid::HidDevice>,
     pub(crate) layout: KeyboardLayout,
@@ -367,6 +619,9 @@ pub(crate) struct ConnectResult {
     /// QMK setting ids the firmware exposes, so later layer-name writes can tell
     /// unsupported storage apart from a transport error.
     pub(crate) supported_qmk_settings: Vec<u16>,
+    /// Readiness and immutable metadata for Bluetooth data loaded after the
+    /// first usable layer is shown.
+    pub(crate) deferred_load: DeferredDeviceLoadState,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -376,12 +631,51 @@ pub(crate) enum ConnectTaskMessage {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone)]
+pub(crate) struct BluetoothReconnectState {
+    pub(crate) identity: DeviceIdentity,
+    pub(crate) display_name: String,
+    pub(crate) retry_attempt: u8,
+    pub(crate) next_attempt_at: std::time::Instant,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl BluetoothReconnectState {
+    pub(crate) fn new(identity: DeviceIdentity, display_name: String) -> Self {
+        Self {
+            identity,
+            display_name,
+            retry_attempt: 0,
+            next_attempt_at: std::time::Instant::now(),
+        }
+    }
+
+    pub(crate) fn schedule_retry(mut self, now: std::time::Instant) -> Self {
+        let delay = bluetooth_reconnect_retry_delay(self.retry_attempt);
+        self.retry_attempt = self.retry_attempt.saturating_add(1);
+        self.next_attempt_at = now + delay;
+        self
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn bluetooth_reconnect_retry_delay(retry_attempt: u8) -> std::time::Duration {
+    match retry_attempt {
+        0 => std::time::Duration::from_millis(500),
+        1 => std::time::Duration::from_secs(1),
+        _ => std::time::Duration::from_secs(2),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) enum ConnectState {
     Idle,
+    Reconnecting(BluetoothReconnectState),
     Loading {
         rx: mpsc::Receiver<ConnectTaskMessage>,
         started_at: std::time::Instant,
         last_progress_at: std::time::Instant,
+        reconnect: Option<BluetoothReconnectState>,
     },
 }
 
@@ -464,6 +758,22 @@ pub(crate) fn vial_layer_retarget_base(kc: u16) -> Option<u16> {
 pub(crate) struct ComboEntry {
     pub(crate) keys: [u16; 4],
     pub(crate) output: u16,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) enum StickyLayoutTapDanceState {
+    #[default]
+    Idle,
+    Pressed {
+        entry: usize,
+        pressed_at: std::time::Instant,
+        tap_count: u8,
+        hold_active: bool,
+    },
+    WaitingForSecondTap {
+        entry: usize,
+        released_at: std::time::Instant,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -773,6 +1083,12 @@ pub(crate) struct BluetoothSelectSetting {
     pub(crate) variants: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BluetoothBooleanSetting {
+    pub(crate) qsid: u16,
+    pub(crate) value: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct BluetoothProfileColorSetting {
     pub(crate) profile: usize,
@@ -784,6 +1100,8 @@ pub(crate) struct BluetoothProfileColorSetting {
 pub(crate) struct BluetoothSettingsState {
     /// Sleep timeout before the keyboard enters Bluetooth sleep mode
     pub(crate) sleep_timeout: Option<BluetoothSelectSetting>,
+    /// Whether the halves show yellow/green battery charging status on their LEDs
+    pub(crate) charge_indicator: Option<BluetoothBooleanSetting>,
     /// Palette color index for each firmware-supported Bluetooth profile
     pub(crate) profile_colors: Vec<BluetoothProfileColorSetting>,
     /// Whether any Bluetooth setting was readable and advertised by firmware
@@ -792,7 +1110,9 @@ pub(crate) struct BluetoothSettingsState {
 
 impl BluetoothSettingsState {
     pub(crate) fn row_count(&self) -> usize {
-        self.sleep_timeout.is_some() as usize + self.profile_colors.len()
+        self.sleep_timeout.is_some() as usize
+            + self.charge_indicator.is_some() as usize
+            + self.profile_colors.len()
     }
 }
 
@@ -801,6 +1121,52 @@ pub(crate) enum ModuleSettingKind {
     Boolean,
     Integer,
     Select,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ModuleDeviceKind {
+    None,
+    Encoder,
+    Trackball,
+    Touchpad,
+    Other,
+}
+
+impl ModuleDeviceKind {
+    pub(crate) fn from_variant(variant: &str) -> Self {
+        match variant.trim().to_ascii_lowercase().as_str() {
+            "none" => Self::None,
+            "encoder" => Self::Encoder,
+            "trackball" => Self::Trackball,
+            "touchpad" | "trackpad" => Self::Touchpad,
+            _ => Self::Other,
+        }
+    }
+
+    pub(crate) fn is_pointing(self) -> bool {
+        matches!(self, Self::Trackball | Self::Touchpad)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PointerModeKind {
+    Normal,
+    Sniper,
+    Scroll,
+    Text,
+    Other,
+}
+
+impl PointerModeKind {
+    pub(crate) fn from_variant(variant: &str) -> Self {
+        match variant.trim().to_ascii_lowercase().as_str() {
+            "normal" => Self::Normal,
+            "sniper" => Self::Sniper,
+            "scroll" => Self::Scroll,
+            "text" => Self::Text,
+            _ => Self::Other,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -823,11 +1189,184 @@ pub(crate) enum ModuleSettingsGroupKind {
     Other,
 }
 
+impl ModuleSettingsGroupKind {
+    pub(crate) fn field_base_title<'a>(self, title: &'a str) -> &'a str {
+        if matches!(self, Self::Left | Self::Right) {
+            title
+                .get(..5)
+                .filter(|prefix| {
+                    prefix.eq_ignore_ascii_case("left ") || prefix.eq_ignore_ascii_case("right ")
+                })
+                .and_then(|_| title.get(5..))
+                .unwrap_or(title)
+        } else {
+            title
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ModuleSettingsGroup {
     pub(crate) title: String,
     pub(crate) kind: ModuleSettingsGroupKind,
     pub(crate) fields: Vec<ModuleSettingField>,
+}
+
+impl ModuleSettingsGroup {
+    pub(crate) fn module_selector_field(&self) -> Option<&ModuleSettingField> {
+        self.fields.iter().find(|field| {
+            matches!(field.kind, ModuleSettingKind::Select)
+                && self
+                    .kind
+                    .field_base_title(&field.title)
+                    .trim()
+                    .eq_ignore_ascii_case("module")
+                && field.variants.iter().any(|variant| {
+                    ModuleDeviceKind::from_variant(variant) != ModuleDeviceKind::Other
+                })
+        })
+    }
+
+    pub(crate) fn supports_module_kind(&self, kind: ModuleDeviceKind) -> bool {
+        self.module_selector_field().is_some_and(|field| {
+            field
+                .variants
+                .iter()
+                .any(|variant| ModuleDeviceKind::from_variant(variant) == kind)
+        })
+    }
+
+    pub(crate) fn mode_selector_field(&self) -> Option<&ModuleSettingField> {
+        self.fields.iter().find(|field| {
+            matches!(field.kind, ModuleSettingKind::Select)
+                && self
+                    .kind
+                    .field_base_title(&field.title)
+                    .trim()
+                    .eq_ignore_ascii_case("mode")
+                && field
+                    .variants
+                    .iter()
+                    .any(|variant| PointerModeKind::from_variant(variant) != PointerModeKind::Other)
+        })
+    }
+
+    pub(crate) fn selected_module_kind(&self, value: u16) -> Option<ModuleDeviceKind> {
+        let field = self.module_selector_field()?;
+        let selected = field
+            .variants
+            .get(value as usize)
+            .map(|variant| ModuleDeviceKind::from_variant(variant))?;
+        if selected != ModuleDeviceKind::None {
+            return Some(selected);
+        }
+
+        field
+            .variants
+            .iter()
+            .map(|variant| ModuleDeviceKind::from_variant(variant))
+            .find(|kind| *kind != ModuleDeviceKind::None)
+            .or(Some(selected))
+    }
+
+    pub(crate) fn selected_pointer_mode(&self, value: u16) -> Option<PointerModeKind> {
+        let field = self.mode_selector_field()?;
+        field
+            .variants
+            .get(value as usize)
+            .map(|variant| PointerModeKind::from_variant(variant))
+    }
+
+    pub(crate) fn field_visible_for_module(
+        &self,
+        field: &ModuleSettingField,
+        selected: ModuleDeviceKind,
+    ) -> bool {
+        let title = self
+            .kind
+            .field_base_title(&field.title)
+            .trim()
+            .to_ascii_lowercase();
+        match title.as_str() {
+            "module" => true,
+            "encoder interval" | "encoder steps" => selected == ModuleDeviceKind::Encoder,
+            "ball axis" | "ball dpi" => selected == ModuleDeviceKind::Trackball,
+            "touch axis" | "touch dpi" | "touch gestures" => selected == ModuleDeviceKind::Touchpad,
+            "mode"
+            | "scroll sens"
+            | "scroll sensitivity"
+            | "sniper sens"
+            | "sniper sensitivity"
+            | "text sens"
+            | "text sensitivity"
+            | "invert scroll"
+            | "invert scroll vertical"
+            | "invert scroll horizontal"
+            | "invert text"
+            | "invert text vertical"
+            | "invert text horizontal"
+            | "acceleration"
+            | "sticky mode"
+            | "led blinks" => selected.is_pointing(),
+            _ => true,
+        }
+    }
+
+    pub(crate) fn field_visible_for_pointer_mode(
+        &self,
+        field: &ModuleSettingField,
+        selected: PointerModeKind,
+    ) -> bool {
+        if selected == PointerModeKind::Other {
+            return true;
+        }
+        let title = self
+            .kind
+            .field_base_title(&field.title)
+            .trim()
+            .to_ascii_lowercase();
+        match title.as_str() {
+            "sniper sens" | "sniper sensitivity" | "auto layer in sniper" => {
+                selected == PointerModeKind::Sniper
+            }
+            "scroll sens"
+            | "scroll sensitivity"
+            | "invert scroll"
+            | "invert scroll vertical"
+            | "invert scroll horizontal"
+            | "auto layer in scroll" => selected == PointerModeKind::Scroll,
+            "text sens"
+            | "text sensitivity"
+            | "invert text"
+            | "invert text vertical"
+            | "invert text horizontal"
+            | "auto layer in text" => selected == PointerModeKind::Text,
+            "auto layer in normal" => selected == PointerModeKind::Normal,
+            _ => true,
+        }
+    }
+
+    pub(crate) fn field_visible_for_selection(
+        &self,
+        field: &ModuleSettingField,
+        selected_module: Option<ModuleDeviceKind>,
+        selected_mode: Option<PointerModeKind>,
+    ) -> bool {
+        match self.kind {
+            ModuleSettingsGroupKind::Left | ModuleSettingsGroupKind::Right => {
+                selected_module
+                    .map(|selected| self.field_visible_for_module(field, selected))
+                    .unwrap_or(true)
+                    && selected_mode
+                        .map(|selected| self.field_visible_for_pointer_mode(field, selected))
+                        .unwrap_or(true)
+            }
+            ModuleSettingsGroupKind::AutoLayer => selected_mode
+                .map(|selected| self.field_visible_for_pointer_mode(field, selected))
+                .unwrap_or(true),
+            ModuleSettingsGroupKind::Other => true,
+        }
+    }
 }
 
 /// Keyboard-specific module settings exposed by firmware QMK Settings.
@@ -998,8 +1537,22 @@ pub(crate) struct OneShotSettingsState {
     pub(crate) tap_toggle: u8,
     /// qsid 6: Timeout in milliseconds before one-shot state is released
     pub(crate) timeout: u16,
-    /// Whether qsid 5 was readable (firmware support flag)
+    /// Bitset of one-shot qsids advertised by this firmware.
+    pub(crate) supported_qsids: u64,
+    /// Whether at least one one-shot setting was readable.
     pub(crate) supported: bool,
+}
+
+impl OneShotSettingsState {
+    pub(crate) fn set_qsid_supported(&mut self, qsid: u16) {
+        if qsid < u64::BITS as u16 {
+            self.supported_qsids |= 1u64 << qsid;
+        }
+    }
+
+    pub(crate) fn supports_qsid(&self, qsid: u16) -> bool {
+        qsid < u64::BITS as u16 && self.supported_qsids & (1u64 << qsid) != 0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1370,8 +1923,15 @@ pub(crate) fn load_rgb_settings(
     dev_conn: &crate::hid::HidDevice,
     layout: &KeyboardLayout,
 ) -> RgbSettingsState {
+    load_rgb_settings_for_mode(dev_conn, layout.lighting_mode.as_deref())
+}
+
+pub(crate) fn load_rgb_settings_for_mode(
+    dev_conn: &crate::hid::HidDevice,
+    lighting_mode: Option<&str>,
+) -> RgbSettingsState {
     let mut candidates = Vec::new();
-    match layout.lighting_mode.as_deref() {
+    match lighting_mode {
         Some("vialrgb") => {
             candidates.extend([RgbSupportKind::VialRgb, RgbSupportKind::QmkRgblight])
         }
@@ -2804,6 +3364,15 @@ pub struct EntropyApp {
     /// Serialized background QMK settings write. Owns the HID handle while active.
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) settings_write_task: Option<SettingsWriteTask>,
+    /// Serialized live Vial read/control operation. Owns the HID handle while active.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) vial_hid_task: Option<VialHidTask>,
+    /// Sole readiness owner for staged Bluetooth layers and settings pages.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) deferred_device_load: DeferredDeviceLoadState,
+    /// User action waiting for every staged Bluetooth layer to become complete.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) deferred_full_layout_action: Option<DeferredFullLayoutAction>,
     pub(super) settings_write_queue: SettingsWriteQueueState,
     pub(super) settings_write_generation: u64,
     pub(super) qmk_settings_write_queue: QmkSettingsWriteQueue,
@@ -2828,6 +3397,9 @@ pub struct EntropyApp {
     pub(crate) scan_frame: u32,
     /// Last device scan timestamp in egui seconds
     pub(crate) last_device_scan_at: f64,
+    /// Next low-frequency battery refresh for supported devices.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) next_battery_refresh_at: Option<std::time::Instant>,
     /// Layer to preview on hover (None = show selected_layer)
     pub(crate) hover_layer: Option<usize>,
     /// Last main keyboard layout geometry: offset_x, offset_y, unit, padding
@@ -2926,7 +3498,10 @@ pub struct EntropyApp {
     pub(crate) sticky_layout_prev_pressed: Vec<bool>,
     pub(crate) sticky_layout_pressed_key_layers: Vec<Option<usize>>,
     pub(crate) sticky_layout_toggled_layers: Vec<bool>,
+    pub(crate) sticky_layout_active_combos: Vec<bool>,
+    pub(crate) sticky_layout_tap_dance_states: Vec<StickyLayoutTapDanceState>,
     pub(crate) sticky_layout_base_layer: usize,
+    pub(crate) sticky_layout_active_layer: usize,
     pub(crate) sticky_layout_last_size: Option<Vec2>,
     pub(crate) sticky_layout_resize_opacity_hold_frames: u8,
     pub(crate) pending_layout_indicator_open_after_unlock: bool,
@@ -2955,6 +3530,8 @@ pub struct EntropyApp {
     pub(crate) tour_target_rects: Vec<(TourTarget, egui::Rect)>,
     /// Vial unlock dialog open
     pub(crate) unlock_open: bool,
+    /// Cached Vial lock state. `None` means the device has not answered yet.
+    pub(crate) vial_unlocked: Option<bool>,
     pub(crate) vial_unlock_keys: Vec<(u8, u8)>,
     pub(crate) vial_unlock_polling: bool,
     pub(crate) vial_unlock_counter: u8,

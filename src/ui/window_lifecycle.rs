@@ -54,6 +54,10 @@ impl EntropyApp {
         }
 
         self.flush_pending_tap_hold_numeric_writes();
+        if self.hid_write_lifecycle_busy() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            return;
+        }
         self.fallback_entropy_display_presets_before_exit();
 
         if self.deferred_exit_has_pending_hid_writes() {
@@ -986,7 +990,7 @@ fn linux_close_to_tray_prompt_copy(
     match (lang, input_method_backend) {
         (crate::i18n::Language::Russian, true) => (
             "Закрыть Entropy?",
-            "Text Expander продолжит работать через IBus/Fcitx после закрытия Entropy",
+            "Text Expander продолжит работать через IBus после закрытия Entropy",
             "Запомнить выбор",
             "Закрыть",
             "В фон",
@@ -994,7 +998,7 @@ fn linux_close_to_tray_prompt_copy(
         ),
         (crate::i18n::Language::English, true) => (
             "Close Entropy?",
-            "Text Expander keeps running through IBus/Fcitx after Entropy closes",
+            "Text Expander keeps running through IBus after Entropy closes",
             "Remember my choice",
             "Close",
             "Keep running",

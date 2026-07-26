@@ -71,9 +71,23 @@ fn hid_lifecycle_writes_available(hid_write_task_active: bool) -> bool {
     !hid_write_task_active
 }
 
+fn should_disable_layout_background(
+    bluetooth_reconnecting: bool,
+    unlock_open: bool,
+    unlock_polling: bool,
+) -> bool {
+    bluetooth_reconnecting || unlock_open || unlock_polling
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn connection_replaces_layout_canvas(connect_state: &ConnectState) -> bool {
-    matches!(connect_state, ConnectState::Loading { .. })
+    matches!(
+        connect_state,
+        ConnectState::Loading {
+            reconnect: None,
+            ..
+        }
+    )
 }
 
 impl EntropyApp {
@@ -100,6 +114,7 @@ impl EntropyApp {
         main_window_hidden_to_tray: bool,
         selected_device_is_bluetooth: bool,
     ) {
+        self.poll_vial_hid_task(ctx);
         self.poll_settings_write(ctx);
         self.flush_due_qmk_setting_writes();
         if should_poll_device_scan(main_window_hidden_to_tray) {
@@ -109,6 +124,7 @@ impl EntropyApp {
             if !self.hid_write_lifecycle_busy() {
                 self.poll_device_scan(ctx);
             }
+            self.maybe_start_bluetooth_reconnect_scan(ctx);
 
             let is_connecting = matches!(self.connect_state, ConnectState::Loading { .. });
             let hid_write_active = self.hid_write_lifecycle_busy();
@@ -137,6 +153,10 @@ impl EntropyApp {
         self.auto_reload_text_expander_rules_file(now);
         self.poll_single_instance_signal(ctx);
         self.poll_connect(ctx);
+        self.maybe_begin_bluetooth_reconnect();
+        self.finish_deferred_full_layout_action(ctx);
+        self.maybe_start_periodic_battery_refresh(ctx, main_window_hidden_to_tray);
+        self.maybe_start_deferred_device_load(ctx, main_window_hidden_to_tray);
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -440,8 +460,43 @@ mod tests {
             rx: receiver,
             started_at: now,
             last_progress_at: now,
+            reconnect: None,
         };
         assert!(connection_replaces_layout_canvas(&loading));
+
+        let reconnecting_loading = ConnectState::Loading {
+            rx: std::sync::mpsc::channel().1,
+            started_at: now,
+            last_progress_at: now,
+            reconnect: Some(BluetoothReconnectState::new(
+                Device {
+                    name: "K:04".to_owned(),
+                    vendor_id: 0xE126,
+                    product_id: 0x0074,
+                    manufacturer: "Ergohaven".to_owned(),
+                    serial_number: "AA:BB:CC:DD:EE:FF".to_owned(),
+                    bus_type: "Bluetooth".to_owned(),
+                    path: "/dev/hidraw4".to_owned(),
+                    firmware: FirmwareProtocol::Vial,
+                }
+                .stable_identity(),
+                "K:04 (Bluetooth)".to_owned(),
+            )),
+        };
+        assert!(!connection_replaces_layout_canvas(&reconnecting_loading));
+    }
+
+    #[test]
+    fn vial_unlock_disables_layout_background_interactions() {
+        assert!(should_disable_layout_background(false, true, false));
+        assert!(should_disable_layout_background(false, false, true));
+        assert!(should_disable_layout_background(false, true, true));
+        assert!(!should_disable_layout_background(false, false, false));
+    }
+
+    #[test]
+    fn bluetooth_reconnect_keeps_layout_background_disabled() {
+        assert!(should_disable_layout_background(true, false, false));
     }
 
     #[test]
@@ -705,18 +760,37 @@ mod tests {
         assert_eq!(app.key_override_entries[0].trigger, 0x0004);
         app.flush_pending_key_override_writes();
 
-        let final_close_output = ctx.run_ui(egui::RawInput::default(), |_ui| {
+        let first_close_output = ctx.run_ui(egui::RawInput::default(), |_ui| {
             app.finish_deferred_exit_after_hid_write(&ctx);
         });
-        assert!(!app.exit_after_hid_write);
+        assert!(app.exit_after_hid_write);
         assert!(app.pending_tap_hold_numeric_writes.is_empty());
-        assert_eq!(app.layout_options_value, Some(0));
-        assert!(final_close_output
+        assert!(app.settings_write_task.is_some());
+        assert!(!first_close_output
             .viewport_output
             .get(&egui::ViewportId::ROOT)
-            .expect("root viewport output exists")
-            .commands
-            .contains(&egui::ViewportCommand::Close));
+            .into_iter()
+            .flat_map(|viewport| &viewport.commands)
+            .any(|command| *command == egui::ViewportCommand::Close));
+
+        let mut close_sent = false;
+        for _ in 0..200 {
+            app.poll_settings_write(&ctx);
+            let output = ctx.run_ui(egui::RawInput::default(), |_ui| {
+                app.finish_deferred_exit_after_hid_write(&ctx);
+            });
+            close_sent |= output
+                .viewport_output
+                .get(&egui::ViewportId::ROOT)
+                .is_some_and(|viewport| viewport.commands.contains(&egui::ViewportCommand::Close));
+            if close_sent {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(close_sent);
+        assert!(!app.exit_after_hid_write);
+        assert_eq!(app.layout_options_value, Some(0));
 
         let completed_requests = recorder.requests();
         assert_eq!(
@@ -1023,15 +1097,22 @@ impl eframe::App for EntropyApp {
                 .selected_device
                 .and_then(|idx| self.device_manager.devices().get(idx))
                 .map(|device| device.is_bluetooth_transport())
-                .unwrap_or(false);
-            let high_frequency_bluetooth_repaint =
-                should_use_high_frequency_bluetooth_repaint(selected_device_is_bluetooth);
+                .unwrap_or(false)
+                || self.bluetooth_reconnect_active();
+            let main_window_uses_wayland = matches!(
+                self.parent_display_handle,
+                Some(raw_window_handle::RawDisplayHandle::Wayland(_))
+            );
+            let bluetooth_visible_interval = bluetooth_visible_repaint_interval(
+                selected_device_is_bluetooth,
+                main_window_uses_wayland,
+            );
             let connect_pending = matches!(self.connect_state, ConnectState::Loading { .. });
             let update_check_pending =
                 matches!(self.update_check, UpdateCheckState::Checking { .. });
             ctx.request_repaint_after(native_repaint_interval(
                 main_window_hidden_to_tray,
-                high_frequency_bluetooth_repaint,
+                bluetooth_visible_interval,
                 connect_pending,
                 update_check_pending,
             ));
@@ -1162,10 +1243,22 @@ impl eframe::App for EntropyApp {
 
         // Main canvas
         egui::CentralPanel::default().show_inside(root_ui, |ui| {
-            if self.selected_device.is_none() {
+            #[cfg(not(target_arch = "wasm32"))]
+            let reconnecting_with_layout =
+                self.bluetooth_reconnect_active() && self.layout.is_some();
+            #[cfg(target_arch = "wasm32")]
+            let reconnecting_with_layout = false;
+
+            if self.selected_device.is_none() && !reconnecting_with_layout {
                 let rect = ui.max_rect();
                 #[cfg(target_os = "linux")]
-                if !super::app_settings_ui::linux_vial_udev_rules_installed() {
+                if !super::app_settings_ui::linux_vial_udev_rules_installed()
+                    && !self
+                        .device_manager
+                        .devices()
+                        .iter()
+                        .any(Device::uses_bluez_gatt_transport)
+                {
                     let empty_rect = egui::Rect::from_center_size(
                         rect.center(),
                         egui::vec2(rect.width().min(520.0), 210.0),
@@ -1303,6 +1396,34 @@ impl eframe::App for EntropyApp {
             }
 
             if let Some(layout) = self.layout.clone() {
+                let disable_layout_background = should_disable_layout_background(
+                    reconnecting_with_layout,
+                    self.unlock_open,
+                    self.vial_unlock_polling,
+                );
+                #[cfg(not(target_arch = "wasm32"))]
+                let deferred_keyboard_blocked = self.main_menu_tab == MainMenuTab::Keyboard
+                    && (!self.selected_layer_data_ready()
+                        || !self.sticky_layout_deferred_data_ready()
+                        || self.deferred_vial_hid_task_active()
+                        || self.deferred_full_layout_action_pending());
+                #[cfg(target_arch = "wasm32")]
+                let deferred_keyboard_blocked = false;
+                if disable_layout_background || deferred_keyboard_blocked {
+                    ui.scope(|ui| {
+                        ui.disable();
+                        self.draw_layout(ui, &layout, ctx);
+                    });
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if reconnecting_with_layout {
+                        self.draw_bluetooth_reconnect_status(ctx);
+                    }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if deferred_keyboard_blocked && !reconnecting_with_layout {
+                        self.draw_deferred_keyboard_overlay(ui);
+                    }
+                    return;
+                }
                 self.draw_layout(ui, &layout, ctx);
             } else if !self.status_msg.is_empty() {
                 let rect = ui.max_rect();
@@ -1482,7 +1603,14 @@ impl eframe::App for EntropyApp {
             self.keycode_picker.key_legend_layout = self.app_settings.key_legend_layout;
             self.keycode_picker.show_shifted_number_symbols =
                 self.app_settings.show_shifted_number_symbols;
-            self.keycode_picker.show(ctx);
+            let macro_data_state = self.picker_macro_data_state();
+            let tap_dance_data_state = self.picker_tap_dance_data_state();
+            self.keycode_picker
+                .show(ctx, macro_data_state, tap_dance_data_state);
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Some(tab) = self.keycode_picker.deferred_retry_tab.take() {
+                self.retry_picker_deferred_data(tab);
+            }
             self.apply_picker_results();
         }
 

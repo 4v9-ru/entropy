@@ -1,11 +1,11 @@
-use crate::device::{Device, DeviceManager};
+use crate::device::{Device, DeviceIdentity, DeviceManager};
 use crate::firmware::FirmwareProtocol;
 
 use crate::keyboard::{KeyboardLayout, LayoutOption, PhysicalEncoder, PhysicalKey};
 use crate::keycode::{
     key_label_font_sizes, keycode_label_with_names_and_layout, keycode_tooltip, KeyLegendLayout,
 };
-use crate::keycode_picker::{KeycodePicker, KeycodeTab};
+use crate::keycode_picker::{DeferredPickerDataState, KeycodePicker, KeycodeTab};
 use egui::{Color32, FontId, RichText, Sense, Stroke, Vec2};
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::mpsc;
@@ -72,6 +72,8 @@ mod device_connect_apply;
 mod device_connect_task;
 #[path = "ui/device_connection.rs"]
 mod device_connection;
+#[path = "ui/device_deferred_load.rs"]
+mod device_deferred_load;
 #[path = "ui/device_scan.rs"]
 mod device_scan;
 #[path = "ui/device_settings_helpers.rs"]
@@ -169,6 +171,10 @@ mod typing_trainer_ui;
 mod ui_scale;
 #[path = "ui/universal_symbols_setup.rs"]
 mod universal_symbols_setup;
+#[path = "ui/vial_hid_task.rs"]
+mod vial_hid_task;
+#[cfg(not(target_arch = "wasm32"))]
+use vial_hid_task::VialHidTask;
 #[path = "vial/unlock.rs"]
 mod vial_unlock;
 #[path = "ui/window_lifecycle.rs"]

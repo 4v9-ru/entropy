@@ -292,21 +292,38 @@ impl EntropyApp {
         const CONNECT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
         const CONNECT_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(240);
 
-        let result = match &mut self.connect_state {
+        enum ConnectPollEvent {
+            Done {
+                result: Result<ConnectResult, String>,
+                reconnect: Option<BluetoothReconnectState>,
+            },
+            Failed {
+                error: String,
+                reconnect: Option<BluetoothReconnectState>,
+            },
+        }
+
+        let event = match &mut self.connect_state {
             ConnectState::Loading {
                 rx,
                 started_at,
                 last_progress_at,
+                reconnect,
             } => match rx.try_recv() {
                 Ok(ConnectTaskMessage::Progress(message)) => {
-                    self.status_msg = message;
+                    if reconnect.is_none() {
+                        self.status_msg = message;
+                    }
                     *last_progress_at = std::time::Instant::now();
                     ctx.request_repaint();
                     return;
                 }
                 Ok(ConnectTaskMessage::Done(result)) => {
                     ctx.request_repaint();
-                    *result
+                    ConnectPollEvent::Done {
+                        result: *result,
+                        reconnect: reconnect.clone(),
+                    }
                 }
                 Err(mpsc::TryRecvError::Empty) => {
                     let idle_timeout = last_progress_at.elapsed() > CONNECT_IDLE_TIMEOUT;
@@ -317,31 +334,43 @@ impl EntropyApp {
                         } else {
                             self.status_msg.clone()
                         };
-                        self.status_msg = format!(
+                        let error = format!(
                             "Connect timeout — RMK/Vial device did not finish loading while: {stage}"
                         );
                         log::warn!("Connect timeout while waiting for stage: {stage}");
-                        self.connect_state = ConnectState::Idle;
+                        ConnectPollEvent::Failed {
+                            error,
+                            reconnect: reconnect.clone(),
+                        }
+                    } else {
+                        #[cfg(not(target_os = "windows"))]
+                        ctx.request_repaint_after(CONNECT_POLL_INTERVAL);
                         return;
                     }
-                    #[cfg(not(target_os = "windows"))]
-                    ctx.request_repaint_after(CONNECT_POLL_INTERVAL);
-                    return;
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    self.status_msg = "Connect thread died".into();
                     log::error!("Connect thread died before returning a result");
-                    self.connect_state = ConnectState::Idle;
-                    return;
+                    ConnectPollEvent::Failed {
+                        error: "Connect thread died".to_owned(),
+                        reconnect: reconnect.clone(),
+                    }
                 }
             },
-            ConnectState::Idle => return,
+            ConnectState::Idle | ConnectState::Reconnecting(_) => return,
         };
 
         self.connect_state = ConnectState::Idle;
+        let (result, reconnect) = match event {
+            ConnectPollEvent::Done { result, reconnect } => (result, reconnect),
+            ConnectPollEvent::Failed { error, reconnect } => (Err(error), reconnect),
+        };
 
         match result {
-            Ok(r) => {
+            Ok(mut r) => {
+                if reconnect.is_some() {
+                    self.preserve_deferred_snapshot_on_reconnect(&mut r);
+                }
+                let staged_bluetooth_load = r.deferred_load.is_staged();
                 self.pending_tap_hold_numeric_writes.clear();
                 self.tap_hold_numeric_write_due = None;
                 log::info!(
@@ -355,7 +384,22 @@ impl EntropyApp {
                 self.firmware = r.layout.firmware;
                 self.current_device_name = r.device_name.clone();
                 self.current_keyboard_id = Some(r.keyboard_id);
+                match &r.vial_unlock_status {
+                    Some((unlocked, keys)) => {
+                        self.vial_unlocked = Some(*unlocked);
+                        self.vial_unlock_keys = keys.clone();
+                    }
+                    None => {
+                        self.vial_unlocked = None;
+                        self.vial_unlock_keys.clear();
+                    }
+                }
                 self.device_about_info = Some(r.about_info.clone());
+                if staged_bluetooth_load {
+                    self.schedule_initial_battery_refresh();
+                } else {
+                    self.schedule_next_battery_refresh();
+                }
                 self.matrix_tester_rmk_byte_order = self.current_device_is_likely_rmk();
                 self.current_encoder_visibility_id =
                     encoder_visibility_id(&r.device_name, r.keyboard_id);
@@ -452,7 +496,12 @@ impl EntropyApp {
                     .map(|bytes| crate::keycode_picker::decode_macro_actions(bytes))
                     .collect();
 
-                self.status_msg = format!("Connected: {}", r.device_name);
+                let connected_display_name = self
+                    .selected_device
+                    .and_then(|idx| self.device_manager.devices().get(idx))
+                    .map(|device| device.display_name_with_transport(&r.device_name))
+                    .unwrap_or_else(|| r.device_name.clone());
+                self.status_msg = format!("Connected: {connected_display_name}");
 
                 // Load per-device layer names.
                 let device_name = r.device_name.clone();
@@ -465,12 +514,16 @@ impl EntropyApp {
                 );
 
                 let encoder_count = r.layout.encoder_count();
-                self.encoder_visibility =
-                    load_encoder_visibility(&self.current_encoder_visibility_id, encoder_count);
-                Self::apply_encoder_layout_options_to_visibility(
+                let hide_modular_encoders_by_default =
+                    self.module_settings_include_encoder_visibility(&r.layout);
+                self.encoder_visibility = Self::resolve_initial_encoder_visibility(
                     &r.layout,
                     self.layout_options_value,
-                    &mut self.encoder_visibility,
+                    load_saved_encoder_visibility(
+                        &self.current_encoder_visibility_id,
+                        encoder_count,
+                    ),
+                    hide_modular_encoders_by_default,
                 );
 
                 // Populate picker
@@ -512,7 +565,10 @@ impl EntropyApp {
                 self.sticky_layout_prev_pressed.clear();
                 self.sticky_layout_pressed_key_layers.clear();
                 self.sticky_layout_toggled_layers = vec![false; r.layout.layers.len().max(1)];
+                self.sticky_layout_active_combos = vec![false; r.combo_entries.len()];
+                self.sticky_layout_tap_dance_states.clear();
                 self.sticky_layout_base_layer = 0;
+                self.sticky_layout_active_layer = 0;
 
                 self.layout = Some(r.layout);
                 self.refresh_layer_picker_content_flags();
@@ -522,6 +578,7 @@ impl EntropyApp {
                 // between qmk-vial and RMK devices.
                 self.hid_device = r.hid_device;
                 self.supported_qmk_settings = r.supported_qmk_settings;
+                self.deferred_device_load = r.deferred_load;
 
                 #[cfg(not(target_arch = "wasm32"))]
                 {
@@ -531,12 +588,17 @@ impl EntropyApp {
 
                 log::info!(
                     "Connected: {} ({} layers, {:?})",
-                    r.device_name,
+                    connected_display_name,
                     r.layer_count,
                     self.firmware
                 );
             }
             Err(e) => {
+                if let Some(reconnect) = reconnect {
+                    self.schedule_bluetooth_reconnect_retry(reconnect, &e);
+                    return;
+                }
+
                 if is_hid_open_failure(&e) {
                     self.selected_device = None;
                     self.clear_connected_keyboard_state(e);

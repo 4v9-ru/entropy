@@ -485,14 +485,42 @@ impl EntropyApp {
     }
 
     pub(super) fn start_connect(&mut self, device_idx: usize) {
+        self.start_connect_with_reconnect(device_idx, None);
+    }
+
+    pub(super) fn start_reconnect_connect(
+        &mut self,
+        device_idx: usize,
+        reconnect: BluetoothReconnectState,
+    ) {
+        self.start_connect_with_reconnect(device_idx, Some(reconnect));
+    }
+
+    fn start_connect_with_reconnect(
+        &mut self,
+        device_idx: usize,
+        reconnect: Option<BluetoothReconnectState>,
+    ) {
         if self.hid_write_task_active() {
-            self.pending_device_connect = Some(device_idx);
+            if let Some(reconnect) = reconnect {
+                self.schedule_bluetooth_reconnect_retry(reconnect, "HID write still active");
+            } else {
+                self.pending_device_connect = Some(device_idx);
+            }
             return;
         }
         if self.qmk_settings_write_pending() {
-            self.pending_device_connect = Some(device_idx);
+            if reconnect.is_none() {
+                self.pending_device_connect = Some(device_idx);
+            }
             self.flush_pending_qmk_setting_writes();
             if self.qmk_settings_write_busy() {
+                if let Some(reconnect) = reconnect {
+                    self.schedule_bluetooth_reconnect_retry(
+                        reconnect,
+                        "QMK settings write still active",
+                    );
+                }
                 return;
             }
         }
@@ -500,67 +528,93 @@ impl EntropyApp {
         let dev = match self.device_manager.devices().get(device_idx) {
             Some(d) => d.clone(),
             None => {
-                self.status_msg = "Device not found".into();
+                if let Some(reconnect) = reconnect {
+                    self.schedule_bluetooth_reconnect_retry(reconnect, "device not found");
+                } else {
+                    self.status_msg = "Device not found".into();
+                }
                 return;
             }
         };
 
-        self.status_msg = format!("Connecting to {}…", dev.name);
-        self.layout = None;
-        self.selected_key = None;
-        self.selected_encoder = None;
-        self.selected_layer = 0;
-        self.layer_write_task = None;
-        self.combo_write_task = None;
-        self.settings_write_task = None;
-        self.reset_settings_write_context();
-        self.qmk_settings_write_queue.clear();
-        self.hid_device = None;
-        self.undo_stack.clear();
-        self.device_about_info = None;
-        self.qmk_hid_hosts.clear();
-        self.combo_visible_count = 1;
-        self.combo_undo_stack.clear();
-        self.combo_pick_target = None;
-        self.combo_dirty = false;
-        self.combo_synced_entries.clear();
-        self.combo_edit_revision = self.combo_edit_revision.wrapping_add(1);
-        self.combo_attempted_revision = None;
-        self.combo_names_dirty = false;
-        self.combo_colors_dirty = false;
-        self.combo_term_dirty = false;
-        self.auto_shift_options = AutoShiftOptionsState::default();
-        self.auto_shift_timeout = None;
-        self.auto_shift_timeout_text.clear();
-        self.mouse_keys_settings = MouseKeysSettingsState::default();
-        self.touchpad_settings = TouchpadSettingsState::default();
-        self.bluetooth_settings = BluetoothSettingsState::default();
-        self.tap_hold_settings = TapHoldSettingsState::default();
-        self.magic_settings = MagicSettingsState::default();
-        self.one_shot_settings = OneShotSettingsState::default();
-        self.layer_led_settings = LayerLedSettingsState::default();
-        self.alt_repeat_entries.clear();
-        self.alt_repeat_names.clear();
-        self.alt_repeat_undo_stack.clear();
-        self.selected_alt_repeat = 0;
-        self.alt_repeat_visible_count = 1;
-        self.alt_repeat_pick_target = None;
-        self.rgb_settings = RgbSettingsState::default();
-        self.layout_options_value = None;
-        self.encoder_visibility.clear();
-        self.keycode_picker.macro_count = 0;
-        self.keycode_picker.macro_texts.clear();
-        self.keycode_picker.macro_names.clear();
-        self.keycode_picker.macro_descriptions.clear();
-        self.keycode_picker.macro_actions.clear();
-        self.keycode_picker.macros_dirty = false;
-        self.key_override_entries.clear();
-        self.key_override_names.clear();
-        self.key_override_visible_count = 1;
-        self.key_override_undo_stack.clear();
-        self.selected_key_override = 0;
-        self.key_override_pick_target = None;
-        self.reset_matrix_tester_state();
+        if let Some(reconnect) = &reconnect {
+            self.status_msg = crate::i18n::tr_catalog_format(
+                self.app_settings.language,
+                "connection.reconnecting",
+                &[("device", &reconnect.display_name)],
+            );
+            self.hid_device = None;
+            self.selected_key = None;
+            self.selected_encoder = None;
+            self.keycode_picker.open = false;
+            self.reset_matrix_tester_state();
+        } else {
+            self.status_msg = format!(
+                "Connecting to {}…",
+                dev.display_name_with_transport(&dev.name)
+            );
+            self.layout = None;
+            self.selected_key = None;
+            self.selected_encoder = None;
+            self.selected_layer = 0;
+            self.layer_write_task = None;
+            self.combo_write_task = None;
+            self.settings_write_task = None;
+            self.vial_hid_task = None;
+            self.deferred_device_load = DeferredDeviceLoadState::default();
+            self.deferred_full_layout_action = None;
+            self.reset_settings_write_context();
+            self.qmk_settings_write_queue.clear();
+            self.hid_device = None;
+            self.undo_stack.clear();
+            self.device_about_info = None;
+            self.next_battery_refresh_at = None;
+            self.qmk_hid_hosts.clear();
+            self.combo_visible_count = 1;
+            self.combo_undo_stack.clear();
+            self.combo_pick_target = None;
+            self.combo_dirty = false;
+            self.combo_synced_entries.clear();
+            self.combo_edit_revision = self.combo_edit_revision.wrapping_add(1);
+            self.combo_attempted_revision = None;
+            self.combo_names_dirty = false;
+            self.combo_colors_dirty = false;
+            self.combo_term_dirty = false;
+            self.auto_shift_options = AutoShiftOptionsState::default();
+            self.auto_shift_timeout = None;
+            self.auto_shift_timeout_text.clear();
+            self.mouse_keys_settings = MouseKeysSettingsState::default();
+            self.touchpad_settings = TouchpadSettingsState::default();
+            self.bluetooth_settings = BluetoothSettingsState::default();
+            self.tap_hold_settings = TapHoldSettingsState::default();
+            self.magic_settings = MagicSettingsState::default();
+            self.one_shot_settings = OneShotSettingsState::default();
+            self.layer_led_settings = LayerLedSettingsState::default();
+            self.alt_repeat_entries.clear();
+            self.alt_repeat_names.clear();
+            self.alt_repeat_undo_stack.clear();
+            self.selected_alt_repeat = 0;
+            self.alt_repeat_visible_count = 1;
+            self.alt_repeat_pick_target = None;
+            self.rgb_settings = RgbSettingsState::default();
+            self.layout_options_value = None;
+            self.encoder_visibility.clear();
+            self.keycode_picker.macro_count = 0;
+            self.keycode_picker.macro_texts.clear();
+            self.keycode_picker.macro_names.clear();
+            self.keycode_picker.macro_descriptions.clear();
+            self.keycode_picker.macro_actions.clear();
+            self.keycode_picker.macros_dirty = false;
+            self.key_override_entries.clear();
+            self.key_override_names.clear();
+            self.key_override_visible_count = 1;
+            self.key_override_undo_stack.clear();
+            self.selected_key_override = 0;
+            self.key_override_pick_target = None;
+            self.vial_unlocked = None;
+            self.vial_unlock_keys.clear();
+            self.reset_matrix_tester_state();
+        }
 
         let (tx, rx) = mpsc::channel();
         let now = std::time::Instant::now();
@@ -568,6 +622,7 @@ impl EntropyApp {
             rx,
             started_at: now,
             last_progress_at: now,
+            reconnect,
         };
 
         std::thread::spawn(move || {
@@ -585,19 +640,20 @@ impl EntropyApp {
                     dev.product_id
                 );
                 let dev_conn =
-                    HidDevice::open_fresh_for(&dev).map_err(|e| format!("Open failed: {e}"))?;
+                    HidDevice::open_fresh_for(&dev).map_err(|e| format!("Open failed: {e:#}"))?;
+                let staged_bluetooth_load = dev_conn.is_bluetooth_transport();
 
                 progress("Reading VIA protocol version…");
                 log::info!("Getting protocol version…");
                 let via_protocol = dev_conn
                     .get_protocol_version()
-                    .map_err(|e| format!("VIA protocol read failed: {e}"))?;
+                    .map_err(|e| format!("VIA protocol read failed: {e:#}"))?;
                 log::info!("VIA protocol version: {via_protocol}");
 
                 progress("Reading Vial keyboard id…");
                 let (vial_protocol, keyboard_id) = dev_conn
                     .get_keyboard_id()
-                    .map_err(|e| format!("Vial keyboard id read failed: {e}"))?;
+                    .map_err(|e| format!("Vial keyboard id read failed: {e:#}"))?;
                 log::info!("Vial protocol: {vial_protocol}, keyboard id: {keyboard_id:016X}");
                 let cache_key = device_cache_key(&dev, keyboard_id);
                 if ![-1i32, 9].contains(&(via_protocol as i32)) {
@@ -608,6 +664,14 @@ impl EntropyApp {
                         "Unsupported Vial protocol version: {vial_protocol}"
                     ));
                 }
+
+                let vial_unlock_status = match dev_conn.get_unlock_status() {
+                    Ok(status) => Some(status),
+                    Err(error) => {
+                        log::warn!("Vial unlock status read failed during connect: {error:#}");
+                        None
+                    }
+                };
 
                 progress("Reading firmware version…");
                 let runtime_firmware_version = match dev_conn.get_firmware_version() {
@@ -628,7 +692,7 @@ impl EntropyApp {
                 log::info!("Getting layout JSON…");
                 let definition_size = dev_conn
                     .get_definition_size()
-                    .map_err(|e| format!("Layout size read failed: {e}"))?;
+                    .map_err(|e| format!("Layout size read failed: {e:#}"))?;
                 let runtime_firmware_cache_token =
                     runtime_firmware_version_cache_token(runtime_firmware_version.as_deref());
                 let json = if let Some(cached) = load_cached_vial_definition(
@@ -643,7 +707,7 @@ impl EntropyApp {
                 } else {
                     let json = dev_conn
                         .get_layout_json_with_size(definition_size)
-                        .map_err(|e| format!("Layout read failed: {e}"))?;
+                        .map_err(|e| format!("Layout read failed: {e:#}"))?;
                     if let Some(runtime_firmware_version) = runtime_firmware_cache_token {
                         save_cached_vial_definition(
                             &cache_key,
@@ -661,7 +725,8 @@ impl EntropyApp {
                 let firmware_version = runtime_firmware_version
                     .clone()
                     .or_else(|| firmware_version_from_vial_json(&json));
-                let battery_halves = if supports_battery_halves_from_vial_json(&json) {
+                let supports_battery_halves = supports_battery_halves_from_vial_json(&json);
+                let battery_halves = if supports_battery_halves && !staged_bluetooth_load {
                     progress("Reading split battery levels…");
                     match dev_conn.get_battery_halves() {
                         Ok(levels) => levels,
@@ -732,7 +797,7 @@ impl EntropyApp {
                 let reported_layer_count = dev_conn
                     .get_layer_count()
                     .map(|c| c as usize)
-                    .map_err(|e| format!("Layer count read failed: {e}"))?;
+                    .map_err(|e| format!("Layer count read failed: {e:#}"))?;
                 let layer_count = normalize_reported_layer_count(reported_layer_count);
                 if layer_count != reported_layer_count {
                     log::warn!(
@@ -745,9 +810,14 @@ impl EntropyApp {
                 layout.layers = vec![vec![0u16; num_keys]; layer_count];
 
                 progress("Reading keymap…");
-                match dev_conn.get_keymap_buffer(layer_count, layout.rows, layout.cols) {
+                let initial_layer_count = if staged_bluetooth_load {
+                    1
+                } else {
+                    layer_count
+                };
+                match dev_conn.get_keymap_buffer(initial_layer_count, layout.rows, layout.cols) {
                     Ok(buf) => {
-                        for layer in 0..layer_count {
+                        for layer in 0..initial_layer_count {
                             for (ki, key) in layout.keys.iter().enumerate() {
                                 let idx = layer * layout.rows * layout.cols
                                     + key.row as usize * layout.cols
@@ -760,6 +830,9 @@ impl EntropyApp {
                         log::info!("Keymap loaded from buffer");
                     }
                     Err(e) => {
+                        if staged_bluetooth_load {
+                            return Err(format!("Initial Bluetooth layer read failed: {e:#}"));
+                        }
                         log::warn!("get_keymap_buffer failed: {e}");
                     }
                 }
@@ -774,8 +847,10 @@ impl EntropyApp {
                 let mut current_firmware_layer_names = vec![None; layer_count];
                 let mut layer_names_from_firmware = vec![false; layer_count];
                 if has_qmk_setting(200) {
-                    for (layer, current_firmware_name) in
-                        current_firmware_layer_names.iter_mut().enumerate()
+                    for (layer, current_firmware_name) in current_firmware_layer_names
+                        .iter_mut()
+                        .enumerate()
+                        .take(initial_layer_count)
                     {
                         let qsid = 200 + layer as u16;
                         if !has_qmk_setting(qsid) {
@@ -796,23 +871,27 @@ impl EntropyApp {
                     }
                 }
 
-                if !has_firmware_layer_names(&layout.layer_names) {
+                if staged_bluetooth_load || !has_firmware_layer_names(&layout.layer_names) {
                     if let Some(local_layer_names) = load_saved_layer_names(&dev.name) {
                         for (layer, name) in
                             local_layer_names.into_iter().enumerate().take(layer_count)
                         {
-                            if !name.trim().is_empty() {
+                            if !layer_names_from_firmware[layer] && !name.trim().is_empty() {
                                 layout.layer_names[layer] = name;
                             }
                         }
                     }
                 }
 
-                let layer_name_updates = layer_name_sync_updates(
-                    &layout.layer_names,
-                    &current_firmware_layer_names,
-                    &supported_qmk_settings,
-                );
+                let layer_name_updates = (!staged_bluetooth_load)
+                    .then(|| {
+                        layer_name_sync_updates(
+                            &layout.layer_names,
+                            &current_firmware_layer_names,
+                            &supported_qmk_settings,
+                        )
+                    })
+                    .unwrap_or_default();
                 if !layer_name_updates.is_empty() {
                     progress("Syncing layer names…");
                     for (qsid, name) in layer_name_updates {
@@ -828,7 +907,7 @@ impl EntropyApp {
                 if !layout.encoders.is_empty() {
                     layout.encoder_layers = vec![vec![0u16; layout.encoders.len()]; layer_count];
                     let encoder_count = layout.encoder_count();
-                    for layer in 0..layer_count {
+                    for layer in 0..initial_layer_count {
                         let mut per_encoder = vec![(0u16, 0u16); encoder_count];
                         for (encoder_idx, encoder_values) in
                             per_encoder.iter_mut().enumerate().take(encoder_count)
@@ -871,11 +950,15 @@ impl EntropyApp {
                         match dev_conn.get_macro_buffer_size() {
                             Ok(size) => {
                                 log::info!("Macro buffer size: {size}");
-                                let macro_texts = match dev_conn.get_macro_buffer(size, count) {
-                                    Ok(buf) => crate::hid::HidDevice::parse_macros(&buf, count),
-                                    Err(e) => {
-                                        log::warn!("get_macro_buffer: {e}");
-                                        vec![Vec::new(); count as usize]
+                                let macro_texts = if staged_bluetooth_load {
+                                    vec![Vec::new(); count as usize]
+                                } else {
+                                    match dev_conn.get_macro_buffer(size, count) {
+                                        Ok(buf) => crate::hid::HidDevice::parse_macros(&buf, count),
+                                        Err(e) => {
+                                            log::warn!("get_macro_buffer: {e}");
+                                            vec![Vec::new(); count as usize]
+                                        }
                                     }
                                 };
                                 (macro_texts, Some(size))
@@ -918,7 +1001,9 @@ impl EntropyApp {
                 };
 
                 progress("Reading combos…");
-                let combo_entries = {
+                let combo_entries = if staged_bluetooth_load {
+                    vec![ComboEntry::default(); combo_count as usize]
+                } else {
                     let count = combo_count;
                     log::info!("Combo count: {count}");
                     let mut entries = Vec::new();
@@ -1006,85 +1091,25 @@ impl EntropyApp {
                     mk
                 };
 
-                let touchpad_settings = {
-                    let mut tp = TouchpadSettingsState::default();
-                    if touchpad_settings_in_definition
-                        && [120u16, 121, 122, 123, 124]
-                            .iter()
-                            .all(|qsid| supported_qmk_settings.contains(qsid))
-                    {
-                        tp.dpi_variants = Self::touchpad_setting_variants(&json, 120);
-                        let dpi_read = if tp.dpi_variants.is_empty() {
-                            dev_conn.get_qmk_setting_u16(120)
-                        } else {
-                            dev_conn.get_qmk_setting_u8(120).map(|value| value as u16)
-                        };
-                        match dpi_read {
-                            Ok(v) => {
-                                tp.dpi = v;
-                                tp.supported = true;
-                                tp.sniper_sens =
-                                    dev_conn.get_qmk_setting_u8(121).unwrap_or_else(|e| {
-                                        log::warn!("get_qmk_setting_u8(touchpad sniper sens): {e}");
-                                        0
-                                    });
-                                tp.scroll_sens =
-                                    dev_conn.get_qmk_setting_u8(122).unwrap_or_else(|e| {
-                                        log::warn!("get_qmk_setting_u8(touchpad scroll sens): {e}");
-                                        0
-                                    });
-                                tp.text_sens =
-                                    dev_conn.get_qmk_setting_u8(123).unwrap_or_else(|e| {
-                                        log::warn!("get_qmk_setting_u8(touchpad text sens): {e}");
-                                        0
-                                    });
-                                tp.bits = dev_conn.get_qmk_setting_u8(124).unwrap_or_else(|e| {
-                                    log::warn!("get_qmk_setting_u8(touchpad bits): {e}");
-                                    0
-                                });
-                                if supported_qmk_settings.contains(&142)
-                                    && Self::touchpad_setting_exists(&json, 142)
-                                {
-                                    tp.auto_layer_enable_supported = true;
-                                    tp.auto_layer_enable = dev_conn
-                                        .get_qmk_setting_u8(142)
-                                        .map(|value| value != 0)
-                                        .unwrap_or_else(|e| {
-                                            log::warn!(
-                                                "get_qmk_setting_u8(touchpad auto layer enable): {e}"
-                                            );
-                                            false
-                                        });
-                                }
-                                if supported_qmk_settings.contains(&143)
-                                    && Self::touchpad_setting_exists(&json, 143)
-                                {
-                                    tp.auto_layer_variants =
-                                        Self::touchpad_setting_variants(&json, 143);
-                                    tp.auto_layer =
-                                        dev_conn.get_qmk_setting_u8(143).unwrap_or_else(|e| {
-                                            log::warn!(
-                                                "get_qmk_setting_u8(touchpad auto layer): {e}"
-                                            );
-                                            0
-                                        });
-                                }
-                            }
-                            Err(e) => {
-                                log::warn!("get_qmk_setting(touchpad dpi): {e}");
-                            }
-                        }
-                    }
-                    tp
+                let touchpad_settings = if staged_bluetooth_load {
+                    TouchpadSettingsState::default()
+                } else {
+                    Self::read_touchpad_settings(&json, &supported_qmk_settings, &dev_conn)
                 };
 
                 progress("Reading Bluetooth settings…");
-                let bluetooth_settings =
-                    Self::read_bluetooth_settings(&json, &supported_qmk_settings, &dev_conn);
+                let bluetooth_settings = if staged_bluetooth_load {
+                    BluetoothSettingsState::default()
+                } else {
+                    Self::read_bluetooth_settings(&json, &supported_qmk_settings, &dev_conn)
+                };
 
                 progress("Reading module settings…");
-                let module_settings =
-                    Self::read_module_settings(&json, &supported_qmk_settings, &dev_conn);
+                let module_settings = if staged_bluetooth_load {
+                    ModuleSettingsState::default()
+                } else {
+                    Self::read_module_settings(&json, &supported_qmk_settings, &dev_conn)
+                };
 
                 let tap_hold_settings = {
                     let mut th = TapHoldSettingsState::default();
@@ -1167,24 +1192,29 @@ impl EntropyApp {
 
                 let one_shot_settings = {
                     let mut os = OneShotSettingsState::default();
-                    match has_qmk_setting(5).then(|| dev_conn.get_qmk_setting_u8(5)) {
-                        Some(Ok(v)) => {
-                            os.tap_toggle = v;
-                            os.supported = true;
-                            os.timeout = if has_qmk_setting(6) {
-                                dev_conn.get_qmk_setting_u16(6).unwrap_or_else(|e| {
-                                    log::warn!("get_qmk_setting_u16(one_shot timeout qsid 6): {e}");
-                                    0
-                                })
-                            } else {
-                                0
-                            };
+                    if has_qmk_setting(5) {
+                        match dev_conn.get_qmk_setting_u8(5) {
+                            Ok(value) => {
+                                os.tap_toggle = value;
+                                os.set_qsid_supported(5);
+                            }
+                            Err(e) => {
+                                log::warn!("get_qmk_setting_u8(one_shot tap toggle qsid 5): {e}");
+                            }
                         }
-                        Some(Err(e)) => {
-                            log::warn!("get_qmk_setting_u8(one_shot tap toggle qsid 5): {e}");
-                        }
-                        None => {}
                     }
+                    if has_qmk_setting(6) {
+                        match dev_conn.get_qmk_setting_u16(6) {
+                            Ok(value) => {
+                                os.timeout = value;
+                                os.set_qsid_supported(6);
+                            }
+                            Err(e) => {
+                                log::warn!("get_qmk_setting_u16(one_shot timeout qsid 6): {e}");
+                            }
+                        }
+                    }
+                    os.supported = os.supported_qsids != 0;
                     os
                 };
 
@@ -1202,15 +1232,20 @@ impl EntropyApp {
                     }
                 };
 
-                let layer_led_settings = Self::read_layer_led_settings(
-                    &json,
-                    &supported_qmk_settings,
-                    layer_count,
-                    &dev_conn,
-                );
+                let layer_led_settings = if staged_bluetooth_load {
+                    LayerLedSettingsState::default()
+                } else {
+                    Self::read_layer_led_settings(
+                        &json,
+                        &supported_qmk_settings,
+                        layer_count,
+                        &dev_conn,
+                    )
+                };
 
-                let rgb_settings = if layer_led_settings.supported && layout.lighting_mode.is_none()
-                {
+                let rgb_settings = if staged_bluetooth_load {
+                    RgbSettingsState::default()
+                } else if layer_led_settings.supported && layout.lighting_mode.is_none() {
                     // hpd3-style Ergohaven boards use QMK RGBLight internally only as a
                     // transport for per-layer LEDs. If the Vial definition does not
                     // explicitly advertise a standard lighting backend, expose Layer LEDs
@@ -1222,7 +1257,9 @@ impl EntropyApp {
                 };
 
                 progress("Reading tap dance entries…");
-                let tap_dance_entries = {
+                let tap_dance_entries = if staged_bluetooth_load {
+                    vec![crate::keycode_picker::TapDanceEntry::default(); tap_dance_count as usize]
+                } else {
                     let count = tap_dance_count;
                     log::info!("Tap dance count: {count}");
                     let mut entries = Vec::new();
@@ -1247,7 +1284,9 @@ impl EntropyApp {
                 };
 
                 progress("Reading key overrides…");
-                let key_override_entries = {
+                let key_override_entries = if staged_bluetooth_load {
+                    vec![KeyOverrideEntry::default(); key_override_count as usize]
+                } else {
                     let count = key_override_count;
                     log::info!("Key Override count: {count}");
                     let mut entries = Vec::new();
@@ -1281,7 +1320,9 @@ impl EntropyApp {
                     entries
                 };
 
-                let alt_repeat_entries = {
+                let alt_repeat_entries = if staged_bluetooth_load {
+                    vec![AltRepeatKeyEntry::default(); reported_alt_repeat_count as usize]
+                } else {
                     let count = reported_alt_repeat_count;
                     log::info!("Alt Repeat count: {count}");
                     let mut entries = Vec::new();
@@ -1307,6 +1348,42 @@ impl EntropyApp {
                 let macro_ext_keycodes_disabled_reason = macro_ext_keycodes_disabled_reason(&json);
                 let supports_macro_ext_keycodes =
                     supports_vial_macro_ext_keycodes(vial_protocol, &json);
+                let deferred_load = if staged_bluetooth_load {
+                    let definition_fingerprint = vial_definition_fingerprint(&json)
+                        .map_err(|error| format!("Layout fingerprint failed: {error}"))?;
+                    let modules_supported =
+                        !Self::module_settings_groups(&json, &supported_qmk_settings).is_empty();
+                    let touchpad_supported = touchpad_settings_in_definition
+                        && [120u16, 121, 122, 123, 124]
+                            .iter()
+                            .all(|qsid| supported_qmk_settings.contains(qsid));
+                    let bluetooth_supported =
+                        Self::bluetooth_settings_supported(&json, &supported_qmk_settings);
+                    let layer_leds_supported =
+                        Self::layer_led_settings_supported(&json, &supported_qmk_settings);
+                    DeferredDeviceLoadState::staged(DeferredDeviceLoadContext {
+                        json: std::sync::Arc::new(json.clone()),
+                        supported_qmk_settings: std::sync::Arc::new(supported_qmk_settings.clone()),
+                        definition_fingerprint,
+                        layer_count,
+                        rows: layout.rows,
+                        cols: layout.cols,
+                        encoder_count: layout.encoder_count(),
+                        macro_count: macro_texts.len().min(u8::MAX as usize) as u8,
+                        macro_memory_bytes,
+                        tap_dance_count,
+                        combo_count,
+                        key_override_count,
+                        alt_repeat_count: reported_alt_repeat_count,
+                        modules_supported,
+                        touchpad_supported,
+                        bluetooth_supported,
+                        layer_leds_supported,
+                        lighting_mode: layout.lighting_mode.clone(),
+                    })
+                } else {
+                    DeferredDeviceLoadState::complete(layer_count)
+                };
 
                 let about_info = DeviceAboutInfo {
                     manufacturer: dev.manufacturer.clone(),
@@ -1315,6 +1392,7 @@ impl EntropyApp {
                     product_id: dev.product_id,
                     path: dev.path.clone(),
                     firmware_version,
+                    supports_battery_halves,
                     battery_halves,
                     via_protocol,
                     vial_protocol,
@@ -1337,6 +1415,7 @@ impl EntropyApp {
                 Ok(ConnectResult {
                     device_name: dev.name.clone(),
                     keyboard_id,
+                    vial_unlock_status,
                     hid_device: Some(dev_conn),
                     about_info,
                     layer_names_from_firmware,
@@ -1365,6 +1444,7 @@ impl EntropyApp {
                     layout,
                     layer_count,
                     supported_qmk_settings,
+                    deferred_load,
                 })
             })();
 
@@ -1373,7 +1453,7 @@ impl EntropyApp {
     }
 
     pub(super) fn resume_pending_device_connect(&mut self) {
-        if self.layer_write_task.is_some() || self.qmk_settings_write_busy() {
+        if self.hid_write_task_owner_active() || self.qmk_settings_write_busy() {
             return;
         }
         if let Some(device_idx) = self.pending_device_connect.take() {

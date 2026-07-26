@@ -1,7 +1,7 @@
 /// Keycode picker modal for Vial/QMK keycodes.
 use crate::app::MacroExtKeycodesDisabledReason;
 use crate::keycode::{
-    gui_label, gui_mod_name, gui_sym, key_label_font_sizes, keycode_label_with_names_and_layout,
+    gui_label, gui_mod_name, key_label_font_sizes, keycode_label_with_names_and_layout,
     keycode_tooltip, modifier_label_from_bits, KeyLegendLayout, KeycodeCategory, KEYCODES,
 };
 use crate::popup_state::{PopupKey, PopupState};
@@ -21,8 +21,6 @@ mod keycode_picker_popups;
 use keycode_picker_popups::*;
 #[path = "keycode_picker_basic.rs"]
 mod keycode_picker_basic;
-#[path = "keycode_picker_emoji.rs"]
-mod keycode_picker_emoji;
 #[path = "keycode_picker_lighting_quantum.rs"]
 mod keycode_picker_lighting_quantum;
 #[path = "keycode_picker_macro.rs"]
@@ -41,10 +39,6 @@ fn plain_modifier_tooltip(mod_name: &str) -> String {
     format!(
         "Use {mod_name} by itself as a held modifier\nLeft click assigns Left {mod_name}\nRight click assigns Right {mod_name}"
     )
-}
-
-fn one_sided_modifier_tooltip(mod_name: &str, side: &str) -> String {
-    format!("Use {side} {mod_name} by itself as a held modifier")
 }
 
 fn mod_combo_tooltip(mod_name: &str, has_right_side: bool) -> String {
@@ -97,6 +91,13 @@ pub struct TapDanceEntry {
     pub tapping_term: u16,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeferredPickerDataState {
+    Ready,
+    Loading,
+    Failed,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MacroAction {
     Text(String),
@@ -140,8 +141,7 @@ pub struct KeycodePicker {
     pub layer_names: Vec<String>,
     pub layer_count: usize,
     pub layer_has_content: Vec<bool>,
-    pub listening: bool,
-    // Vial Quantum tab pending state
+    // Pending key selection for Mod+Key and Mod-Tap actions
     pub vial_quantum_pending_mod: Option<u16>,
     pub vial_quantum_pending_mt: Option<u16>,
     pub vial_layer_pending: Option<u16>,
@@ -177,13 +177,11 @@ pub struct KeycodePicker {
     macro_undo_stack: Vec<(usize, Vec<MacroAction>)>,
     /// Macro key picker: (macro_idx, action_idx) being edited
     macro_key_pick: Option<(usize, usize)>,
-    pub emoji_search_query: String,
-    pub emoji_skin_tone: crate::emoji_catalog::EmojiSkinTone,
-    pub emoji_selected: Option<&'static crate::emoji_catalog::EmojiEntry>,
     popup_state: PopupState,
     pub language: crate::i18n::Language,
     pub key_legend_layout: KeyLegendLayout,
     pub show_shifted_number_symbols: bool,
+    pub deferred_retry_tab: Option<KeycodeTab>,
 }
 
 fn tr_picker(language: crate::i18n::Language, key: &'static str) -> &'static str {
@@ -351,7 +349,6 @@ impl Default for KeycodePicker {
             layer_names: (0..16).map(|i| i.to_string()).collect(),
             layer_count: 4,
             layer_has_content: vec![true; 16],
-            listening: false,
             vial_quantum_pending_mod: None,
             vial_quantum_pending_mt: None,
             vial_layer_pending: None,
@@ -375,14 +372,12 @@ impl Default for KeycodePicker {
             macro_actions: vec![vec![]; 16],
             macro_undo_stack: Vec::new(),
             macro_key_pick: None,
-            emoji_search_query: String::new(),
-            emoji_skin_tone: crate::emoji_catalog::EmojiSkinTone::Default,
-            emoji_selected: None,
             macros_dirty: false,
             popup_state: PopupState::default(),
             language: crate::i18n::default_language(),
             key_legend_layout: KeyLegendLayout::default(),
             show_shifted_number_symbols: true,
+            deferred_retry_tab: None,
         }
     }
 }
@@ -543,10 +538,6 @@ impl KeycodePicker {
         self.td_mod_key_pick = None;
     }
 
-    pub(crate) fn open_regular_key_picker(&mut self) {
-        self.open_regular_key_picker_with_mod_key(false);
-    }
-
     pub(crate) fn open_regular_key_picker_with_mod_key(&mut self, allow_mod_key: bool) {
         self.result = None;
         self.open = true;
@@ -588,13 +579,17 @@ impl KeycodePicker {
         };
     }
 
-    pub fn show(&mut self, ctx: &egui::Context) {
+    pub fn show(
+        &mut self,
+        ctx: &egui::Context,
+        macro_data_state: DeferredPickerDataState,
+        tap_dance_data_state: DeferredPickerDataState,
+    ) {
         let macro_key_pick_open = self.macro_key_pick.is_some();
         let regular_key_pick_open = self.regular_key_pick || self.regular_mod_key_pick.is_some();
         let layer_pick_open = self.vial_layer_pending.is_some();
         let pending_key_pick_open =
             self.vial_quantum_pending_mod.is_some() || self.vial_quantum_pending_mt.is_some();
-        let tap_dance_editor_open = self.tap_dance_editor_open.is_some();
         let td_key_pick_open = self.td_key_pick.is_some() || self.td_mod_key_pick.is_some();
 
         self.popup_state
@@ -607,8 +602,6 @@ impl KeycodePicker {
             .begin_frame(PopupKey::PickLayerWindow, layer_pick_open);
         self.popup_state
             .begin_frame(PopupKey::PendingKeyPickWindow, pending_key_pick_open);
-        self.popup_state
-            .begin_frame(PopupKey::TapDanceEditorWindow, tap_dance_editor_open);
         self.popup_state
             .begin_frame(PopupKey::TdKeyPickWindow, td_key_pick_open);
 
@@ -766,12 +759,17 @@ impl KeycodePicker {
             return;
         }
 
-        self.show_vial(ctx);
+        self.show_vial(ctx, macro_data_state, tap_dance_data_state);
     }
 
     // ─────────────────────────── VIAL PICKER ────────────────────────────────
 
-    fn show_vial(&mut self, ctx: &egui::Context) {
+    fn show_vial(
+        &mut self,
+        ctx: &egui::Context,
+        macro_data_state: DeferredPickerDataState,
+        tap_dance_data_state: DeferredPickerDataState,
+    ) {
         if self.selected_tab == KeycodeTab::Layers {
             self.selected_tab = KeycodeTab::Modifiers;
         }
@@ -901,7 +899,11 @@ impl KeycodePicker {
 
                                 if self.selected_tab == KeycodeTab::Basic {
                                     ui.add_space(28.0);
-                                    self.show_vial_tab_content(ui);
+                                    self.show_vial_tab_content(
+                                        ui,
+                                        macro_data_state,
+                                        tap_dance_data_state,
+                                    );
                                 } else {
                                     let centered_width = self.tab_content_width(ui);
                                     let x_offset =
@@ -914,7 +916,13 @@ impl KeycodePicker {
                                         ui.allocate_ui_with_layout(
                                             Vec2::new(centered_width, 0.0),
                                             egui::Layout::top_down(egui::Align::Min),
-                                            |ui| self.show_vial_tab_content(ui),
+                                            |ui| {
+                                                self.show_vial_tab_content(
+                                                    ui,
+                                                    macro_data_state,
+                                                    tap_dance_data_state,
+                                                )
+                                            },
                                         );
                                     });
                                 }
@@ -1400,13 +1408,64 @@ impl KeycodePicker {
         }
     }
 
-    fn show_vial_tab_content(&mut self, ui: &mut egui::Ui) {
+    fn show_vial_tab_content(
+        &mut self,
+        ui: &mut egui::Ui,
+        macro_data_state: DeferredPickerDataState,
+        tap_dance_data_state: DeferredPickerDataState,
+    ) {
+        let deferred_data_state = match self.selected_tab {
+            KeycodeTab::Macro => macro_data_state,
+            KeycodeTab::TapDance => tap_dance_data_state,
+            _ => DeferredPickerDataState::Ready,
+        };
+        if deferred_data_state != DeferredPickerDataState::Ready {
+            ui.vertical_centered(|ui| {
+                ui.add_space(52.0);
+                match deferred_data_state {
+                    DeferredPickerDataState::Loading => {
+                        ui.add(egui::Spinner::new().size(18.0));
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new(tr_picker(
+                                self.language,
+                                "connection.loading_device_data",
+                            ))
+                            .size(13.0)
+                            .color(ui.visuals().weak_text_color()),
+                        );
+                    }
+                    DeferredPickerDataState::Failed => {
+                        ui.label(
+                            RichText::new(tr_picker(
+                                self.language,
+                                "connection.device_data_load_failed",
+                            ))
+                            .size(13.0)
+                            .color(ui.visuals().weak_text_color()),
+                        );
+                        ui.add_space(10.0);
+                        if crate::ui_style::modern_button(
+                            ui,
+                            tr_picker(self.language, "connection.retry_device_data"),
+                            egui::vec2(120.0, 32.0),
+                            true,
+                        )
+                        .clicked()
+                        {
+                            self.deferred_retry_tab = Some(self.selected_tab);
+                        }
+                    }
+                    DeferredPickerDataState::Ready => {}
+                }
+            });
+            return;
+        }
         match self.selected_tab {
             KeycodeTab::Basic => self.show_vial_basic(ui),
             KeycodeTab::Symbols => self.show_vial_symbols(ui),
             KeycodeTab::Layers => self.show_vial_layers(ui),
             KeycodeTab::Modifiers => self.show_vial_modifiers(ui),
-            KeycodeTab::Quantum => self.show_vial_quantum(ui),
             KeycodeTab::Rgb => self.show_vial_rgb(ui),
             KeycodeTab::Macro => self.show_vial_macros(ui),
             KeycodeTab::TapDance => self.show_vial_tap_dance(ui),

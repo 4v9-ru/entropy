@@ -1,18 +1,17 @@
+#[cfg(not(target_arch = "wasm32"))]
+use super::vial_hid_task::VialHidTaskStart;
 use super::*;
 
 impl EntropyApp {
-    fn matrix_tester_poll_interval(&self) -> std::time::Duration {
-        #[cfg(target_os = "windows")]
-        if self
-            .selected_device
+    fn matrix_tester_uses_bluetooth_transport(&self) -> bool {
+        self.selected_device
             .and_then(|idx| self.device_manager.devices().get(idx))
             .map(|device| device.is_bluetooth_transport())
             .unwrap_or(false)
-        {
-            return std::time::Duration::from_millis(125);
-        }
+    }
 
-        MATRIX_TESTER_POLL_INTERVAL
+    fn matrix_tester_poll_interval(&self) -> std::time::Duration {
+        matrix_tester_poll_interval_for_transport(self.matrix_tester_uses_bluetooth_transport())
     }
 
     pub(super) fn reset_matrix_tester_state(&mut self) {
@@ -21,7 +20,10 @@ impl EntropyApp {
         self.sticky_layout_prev_pressed.clear();
         self.sticky_layout_pressed_key_layers.clear();
         self.sticky_layout_toggled_layers.clear();
+        self.sticky_layout_active_combos.clear();
+        self.sticky_layout_tap_dance_states.clear();
         self.sticky_layout_base_layer = 0;
+        self.sticky_layout_active_layer = 0;
         self.matrix_tester_last_poll = std::time::Instant::now() - MATRIX_TESTER_POLL_INTERVAL;
         self.matrix_tester_last_lock_check =
             std::time::Instant::now() - MATRIX_TESTER_LOCK_CHECK_INTERVAL;
@@ -76,14 +78,29 @@ impl EntropyApp {
         if self.unlock_open || self.vial_unlock_polling {
             return;
         }
+        if self.is_vial_locked() {
+            return;
+        }
         #[cfg(target_os = "windows")]
-        if self
-            .selected_device
-            .and_then(|idx| self.device_manager.devices().get(idx))
-            .map(|device| device.is_bluetooth_transport())
-            .unwrap_or(false)
-        {
+        if self.matrix_tester_uses_bluetooth_transport() {
             self.matrix_tester_pressed.clear();
+            return;
+        }
+
+        let now = std::time::Instant::now();
+        let poll_interval = self.matrix_tester_poll_interval();
+
+        #[cfg(not(target_os = "windows"))]
+        if self.matrix_tester_uses_bluetooth_transport() {
+            if now.duration_since(self.matrix_tester_last_poll) >= poll_interval {
+                match self.start_vial_matrix_poll(ctx, rows, cols, remember_ever_pressed) {
+                    VialHidTaskStart::Started => {
+                        self.matrix_tester_last_poll = now;
+                    }
+                    VialHidTaskStart::Busy | VialHidTaskStart::NoDevice => {}
+                }
+            }
+            ctx.request_repaint_after(poll_interval);
             return;
         }
 
@@ -91,8 +108,6 @@ impl EntropyApp {
             return;
         };
 
-        let now = std::time::Instant::now();
-        let poll_interval = self.matrix_tester_poll_interval();
         if now.duration_since(self.matrix_tester_last_poll) >= poll_interval {
             self.matrix_tester_last_poll = now;
             let poll_result = hid.get_switch_matrix_with_rmk_byte_order(
@@ -102,24 +117,14 @@ impl EntropyApp {
             );
             match poll_result {
                 Ok(pressed) => {
-                    if remember_ever_pressed {
-                        if self.matrix_tester_ever_pressed.len() != pressed.len() {
-                            self.matrix_tester_ever_pressed = vec![false; pressed.len()];
-                        }
-                        for (idx, &is_pressed) in pressed.iter().enumerate() {
-                            if is_pressed {
-                                if let Some(seen) = self.matrix_tester_ever_pressed.get_mut(idx) {
-                                    *seen = true;
-                                }
-                            }
-                        }
-                    }
-                    self.matrix_tester_pressed = pressed;
+                    self.finish_matrix_tester_poll(pressed, remember_ever_pressed);
                 }
                 Err(e) => {
                     log::warn!("Matrix poll error: {e}");
                     if crate::hid::is_disconnect_error(&e) {
-                        self.clear_connected_keyboard_state("Device disconnected");
+                        if !self.begin_bluetooth_reconnect(e.to_string()) {
+                            self.clear_connected_keyboard_state("Device disconnected");
+                        }
                         return;
                     }
                     self.matrix_tester_lock_checked = false;
@@ -132,8 +137,37 @@ impl EntropyApp {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn finish_matrix_tester_poll(
+        &mut self,
+        pressed: Vec<bool>,
+        remember_ever_pressed: bool,
+    ) {
+        if remember_ever_pressed {
+            if self.matrix_tester_ever_pressed.len() != pressed.len() {
+                self.matrix_tester_ever_pressed = vec![false; pressed.len()];
+            }
+            for (idx, &is_pressed) in pressed.iter().enumerate() {
+                if is_pressed {
+                    if let Some(seen) = self.matrix_tester_ever_pressed.get_mut(idx) {
+                        *seen = true;
+                    }
+                }
+            }
+        }
+        self.matrix_tester_pressed = pressed;
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn fail_matrix_tester_poll(&mut self, error: String) {
+        log::warn!("Matrix poll error: {error}");
+        self.matrix_tester_lock_checked = false;
+        self.matrix_tester_last_lock_check =
+            std::time::Instant::now() - MATRIX_TESTER_LOCK_CHECK_INTERVAL;
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn poll_matrix_tester(&mut self, ctx: &egui::Context, layout: &KeyboardLayout) {
-        if self.main_menu_tab != MainMenuTab::Settings {
+        if self.main_menu_tab != MainMenuTab::Settings || self.top_dropdown_open(ctx) {
             return;
         }
         self.poll_switch_matrix_state(ctx, layout.rows, layout.cols, true);
@@ -153,7 +187,7 @@ impl EntropyApp {
         let hid_ready = {
             #[cfg(not(target_arch = "wasm32"))]
             {
-                self.hid_device.is_some()
+                self.hid_device.is_some() || self.vial_hid_task_active()
             }
             #[cfg(target_arch = "wasm32")]
             {
@@ -357,7 +391,42 @@ impl EntropyApp {
             } else {
                 app_border_color(dark)
             };
-            paint_layout_keycap(&painter, rect, key.rotation, fill, Stroke::new(1.0_f32, stroke));
+            paint_layout_keycap(
+                &painter,
+                rect,
+                key.rotation,
+                fill,
+                Stroke::new(1.0_f32, stroke),
+            );
         }
+    }
+}
+
+fn matrix_tester_poll_interval_for_transport(bluetooth: bool) -> std::time::Duration {
+    if bluetooth {
+        MATRIX_TESTER_BLUETOOTH_POLL_INTERVAL
+    } else {
+        MATRIX_TESTER_POLL_INTERVAL
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bluetooth_matrix_polling_is_paced_for_ble() {
+        assert_eq!(
+            matrix_tester_poll_interval_for_transport(true),
+            std::time::Duration::from_millis(80)
+        );
+    }
+
+    #[test]
+    fn usb_matrix_polling_keeps_realtime_cadence() {
+        assert_eq!(
+            matrix_tester_poll_interval_for_transport(false),
+            std::time::Duration::from_millis(16)
+        );
     }
 }

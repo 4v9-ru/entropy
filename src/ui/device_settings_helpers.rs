@@ -2,11 +2,15 @@ use super::*;
 
 impl EntropyApp {
     pub(super) fn is_encoder_layout_option(option: &LayoutOption) -> bool {
-        option
-            .label
-            .trim_start()
-            .to_ascii_lowercase()
-            .starts_with("hide encoder")
+        if !option.choices.is_empty() {
+            return false;
+        }
+
+        let label = option.label.trim().to_ascii_lowercase();
+        label.starts_with("hide ")
+            && label
+                .split_whitespace()
+                .any(|word| matches!(word, "encoder" | "encoders"))
     }
 
     pub(super) fn encoder_layout_option_indices(layout: &KeyboardLayout) -> Vec<usize> {
@@ -65,38 +69,11 @@ impl EntropyApp {
         }
     }
 
-    fn module_setting_base_title<'a>(
-        group_kind: ModuleSettingsGroupKind,
-        title: &'a str,
-    ) -> &'a str {
-        if matches!(
-            group_kind,
-            ModuleSettingsGroupKind::Left | ModuleSettingsGroupKind::Right
-        ) {
-            title
-                .strip_prefix("Left ")
-                .or_else(|| title.strip_prefix("Right "))
-                .unwrap_or(title)
-        } else {
-            title
-        }
-    }
-
-    fn module_setting_variant_is_encoder(variant: &str) -> bool {
-        variant.trim().eq_ignore_ascii_case("encoder")
-    }
-
     fn module_group_encoder_field(group: &ModuleSettingsGroup) -> Option<&ModuleSettingField> {
-        group.fields.iter().find(|field| {
-            matches!(field.kind, ModuleSettingKind::Select)
-                && Self::module_setting_base_title(group.kind, &field.title)
-                    .trim()
-                    .eq_ignore_ascii_case("module")
-                && field
-                    .variants
-                    .iter()
-                    .any(|variant| Self::module_setting_variant_is_encoder(variant))
-        })
+        group
+            .supports_module_kind(ModuleDeviceKind::Encoder)
+            .then(|| group.module_selector_field())
+            .flatten()
     }
 
     fn module_settings_encoder_visible_for_position(
@@ -122,12 +99,13 @@ impl EntropyApp {
         let Some(field) = Self::module_group_encoder_field(group) else {
             return true;
         };
-        let selected_idx = module_settings.value(field.qsid) as usize;
-        field
-            .variants
-            .get(selected_idx)
-            .map(|variant| Self::module_setting_variant_is_encoder(variant))
-            .unwrap_or(true)
+        match group.selected_module_kind(module_settings.value(field.qsid)) {
+            Some(ModuleDeviceKind::Encoder) => true,
+            Some(
+                ModuleDeviceKind::None | ModuleDeviceKind::Trackball | ModuleDeviceKind::Touchpad,
+            ) => false,
+            Some(ModuleDeviceKind::Other) | None => true,
+        }
     }
 
     pub(super) fn module_settings_encoder_visible(
@@ -383,6 +361,72 @@ impl EntropyApp {
             .all(|qsid| Self::touchpad_setting_exists(json, *qsid))
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn read_touchpad_settings(
+        json: &serde_json::Value,
+        supported_qmk_settings: &[u16],
+        dev_conn: &crate::hid::HidDevice,
+    ) -> TouchpadSettingsState {
+        let mut settings = TouchpadSettingsState::default();
+        if !Self::layout_json_has_touchpad_settings(json)
+            || ![120u16, 121, 122, 123, 124]
+                .iter()
+                .all(|qsid| supported_qmk_settings.contains(qsid))
+        {
+            return settings;
+        }
+
+        settings.dpi_variants = Self::touchpad_setting_variants(json, 120);
+        let dpi_read = if settings.dpi_variants.is_empty() {
+            dev_conn.get_qmk_setting_u16(120)
+        } else {
+            dev_conn.get_qmk_setting_u8(120).map(|value| value as u16)
+        };
+        let Ok(dpi) = dpi_read else {
+            log::warn!("get_qmk_setting(touchpad dpi) failed");
+            return settings;
+        };
+
+        settings.dpi = dpi;
+        settings.supported = true;
+        settings.sniper_sens = dev_conn.get_qmk_setting_u8(121).unwrap_or_else(|error| {
+            log::warn!("get_qmk_setting_u8(touchpad sniper sens): {error}");
+            0
+        });
+        settings.scroll_sens = dev_conn.get_qmk_setting_u8(122).unwrap_or_else(|error| {
+            log::warn!("get_qmk_setting_u8(touchpad scroll sens): {error}");
+            0
+        });
+        settings.text_sens = dev_conn.get_qmk_setting_u8(123).unwrap_or_else(|error| {
+            log::warn!("get_qmk_setting_u8(touchpad text sens): {error}");
+            0
+        });
+        settings.bits = dev_conn.get_qmk_setting_u8(124).unwrap_or_else(|error| {
+            log::warn!("get_qmk_setting_u8(touchpad bits): {error}");
+            0
+        });
+
+        if supported_qmk_settings.contains(&142) && Self::touchpad_setting_exists(json, 142) {
+            settings.auto_layer_enable_supported = true;
+            settings.auto_layer_enable = dev_conn
+                .get_qmk_setting_u8(142)
+                .map(|value| value != 0)
+                .unwrap_or_else(|error| {
+                    log::warn!("get_qmk_setting_u8(touchpad auto layer enable): {error}");
+                    false
+                });
+        }
+        if supported_qmk_settings.contains(&143) && Self::touchpad_setting_exists(json, 143) {
+            settings.auto_layer_variants = Self::touchpad_setting_variants(json, 143);
+            settings.auto_layer = dev_conn.get_qmk_setting_u8(143).unwrap_or_else(|error| {
+                log::warn!("get_qmk_setting_u8(touchpad auto layer): {error}");
+                0
+            });
+        }
+
+        settings
+    }
+
     fn bluetooth_setting_variants(field: &serde_json::Value) -> Vec<String> {
         field
             .get("variants")
@@ -429,6 +473,23 @@ impl EntropyApp {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
+    fn read_bluetooth_boolean_setting(
+        dev_conn: &crate::hid::HidDevice,
+        field: &serde_json::Value,
+        qsid: u16,
+        label: &str,
+    ) -> Option<BluetoothBooleanSetting> {
+        if field.get("type").and_then(|value| value.as_str()) != Some("boolean") {
+            return None;
+        }
+        let value = dev_conn.get_qmk_setting_u8(qsid).unwrap_or_else(|e| {
+            log::warn!("get_qmk_setting({label} qsid {qsid}): {e}");
+            0
+        }) != 0;
+        Some(BluetoothBooleanSetting { qsid, value })
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn read_bluetooth_settings(
         json: &serde_json::Value,
         supported_qmk_settings: &[u16],
@@ -436,6 +497,7 @@ impl EntropyApp {
     ) -> BluetoothSettingsState {
         let has_qmk_setting = |qsid: u16| supported_qmk_settings.contains(&qsid);
         let mut sleep_timeout = None;
+        let mut charge_indicator = None;
         let mut profile_colors = Vec::<(usize, BluetoothSelectSetting)>::new();
 
         if let Some(tabs) = json.get("settings").and_then(|value| value.as_array()) {
@@ -473,6 +535,13 @@ impl EntropyApp {
                         qsid,
                         "bluetooth sleep timeout",
                     );
+                } else if lower_title.contains("charge") && lower_title.contains("indicator") {
+                    charge_indicator = Self::read_bluetooth_boolean_setting(
+                        dev_conn,
+                        field,
+                        qsid,
+                        "bluetooth charge indicator",
+                    );
                 } else if lower_title.contains("bt profile") && lower_title.contains("color") {
                     if let Some(profile) =
                         Self::parse_trailing_setting_index(&lower_title, "bt profile", "color")
@@ -496,13 +565,59 @@ impl EntropyApp {
             .filter(|(profile, _)| *profile <= 4)
             .map(|(profile, setting)| BluetoothProfileColorSetting { profile, setting })
             .collect::<Vec<_>>();
-        let supported = sleep_timeout.is_some() || !profile_colors.is_empty();
+        let supported =
+            sleep_timeout.is_some() || charge_indicator.is_some() || !profile_colors.is_empty();
 
         BluetoothSettingsState {
             sleep_timeout,
+            charge_indicator,
             profile_colors,
             supported,
         }
+    }
+
+    pub(super) fn bluetooth_settings_supported(
+        json: &serde_json::Value,
+        supported_qmk_settings: &[u16],
+    ) -> bool {
+        json.get("settings")
+            .and_then(|value| value.as_array())
+            .into_iter()
+            .flatten()
+            .filter(|tab| {
+                tab.get("name")
+                    .and_then(|value| value.as_str())
+                    .map(|name| name.to_ascii_lowercase().contains("bluetooth"))
+                    .unwrap_or(false)
+            })
+            .filter_map(|tab| tab.get("fields").and_then(|value| value.as_array()))
+            .flatten()
+            .any(|field| {
+                let Some(qsid) = field
+                    .get("qsid")
+                    .and_then(|value| value.as_u64())
+                    .and_then(|value| u16::try_from(value).ok())
+                else {
+                    return false;
+                };
+                if !supported_qmk_settings.contains(&qsid) {
+                    return false;
+                }
+                let title = field
+                    .get("title")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                (title.contains("sleep")
+                    && title.contains("timeout")
+                    && !Self::bluetooth_setting_variants(field).is_empty())
+                    || (title.contains("charge")
+                        && title.contains("indicator")
+                        && field.get("type").and_then(|value| value.as_str()) == Some("boolean"))
+                    || (title.contains("bt profile")
+                        && title.contains("color")
+                        && !Self::bluetooth_setting_variants(field).is_empty())
+            })
     }
 
     fn parse_trailing_setting_index(
@@ -599,6 +714,48 @@ impl EntropyApp {
             value,
             max,
         }
+    }
+
+    pub(super) fn layer_led_settings_supported(
+        json: &serde_json::Value,
+        supported_qmk_settings: &[u16],
+    ) -> bool {
+        if supported_qmk_settings.contains(&300) {
+            return true;
+        }
+        json.get("settings")
+            .and_then(|value| value.as_array())
+            .into_iter()
+            .flatten()
+            .filter(|tab| {
+                tab.get("name")
+                    .and_then(|value| value.as_str())
+                    .map(|name| name.to_ascii_lowercase().contains("led"))
+                    .unwrap_or(false)
+            })
+            .filter_map(|tab| tab.get("fields").and_then(|value| value.as_array()))
+            .flatten()
+            .any(|field| {
+                let Some(qsid) = field
+                    .get("qsid")
+                    .and_then(|value| value.as_u64())
+                    .and_then(|value| u16::try_from(value).ok())
+                else {
+                    return false;
+                };
+                if !supported_qmk_settings.contains(&qsid) {
+                    return false;
+                }
+                let title = field
+                    .get("title")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                title.contains("led brightness")
+                    || title.contains("led timeout")
+                    || (title.contains("bt profile") && title.contains("color"))
+                    || (title.contains("layer") && title.contains("color"))
+            })
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -1805,6 +1962,64 @@ mod tests {
         assert!(EntropyApp::module_settings_encoder_visible(
             &settings, &layout, 0
         ));
+    }
+
+    #[test]
+    fn encoder_layout_options_include_left_and_right_module_labels() {
+        let mut layout = test_layout_with_encoders(&[0, 1]);
+        layout.layout_options = vec![
+            LayoutOption {
+                label: "Hide left encoder module".to_string(),
+                choices: Vec::new(),
+            },
+            LayoutOption {
+                label: "Hide right encoder module".to_string(),
+                choices: Vec::new(),
+            },
+            LayoutOption {
+                label: "OLED master".to_string(),
+                choices: vec!["Disabled".to_string(), "Clock".to_string()],
+            },
+        ];
+
+        assert_eq!(
+            EntropyApp::encoder_layout_option_indices(&layout),
+            vec![0, 1]
+        );
+
+        let packed = EntropyApp::pack_layout_option_values(&layout.layout_options, &[1, 0, 0]);
+        let mut visibility = vec![true, true];
+        EntropyApp::apply_encoder_layout_options_to_visibility(
+            &layout,
+            Some(packed),
+            &mut visibility,
+        );
+        assert_eq!(visibility, vec![false, true]);
+    }
+
+    #[test]
+    fn encoder_layout_option_requires_boolean_hide_label() {
+        for label in [
+            "Hide encoder",
+            "Hide left encoder",
+            "Hide right encoder",
+            "Hide left encoder module",
+            "Hide right encoder module",
+        ] {
+            assert!(EntropyApp::is_encoder_layout_option(&LayoutOption {
+                label: label.to_string(),
+                choices: Vec::new(),
+            }));
+        }
+
+        assert!(!EntropyApp::is_encoder_layout_option(&LayoutOption {
+            label: "Encoder display preset".to_string(),
+            choices: Vec::new(),
+        }));
+        assert!(!EntropyApp::is_encoder_layout_option(&LayoutOption {
+            label: "Hide encoder style".to_string(),
+            choices: vec!["Compact".to_string(), "Full".to_string()],
+        }));
     }
 
     #[test]
