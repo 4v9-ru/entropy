@@ -1605,8 +1605,14 @@ impl EntropyApp {
             .and_then(|idx| self.device_manager.devices().get(idx))
             .map(|device| device.path.as_str());
 
-        let mut desired =
-            std::collections::HashMap::<String, crate::qmk_hid_host::HostDataMode>::new();
+        let mut desired = std::collections::HashMap::<
+            String,
+            (
+                crate::device::Device,
+                crate::qmk_hid_host::HostDataMode,
+                Option<crate::hid::SharedHidOutput>,
+            ),
+        >::new();
 
         for device in self.device_manager.devices() {
             if device.firmware != FirmwareProtocol::Vial {
@@ -1630,17 +1636,23 @@ impl EntropyApp {
             }
 
             if !mode.is_empty() {
-                desired.insert(device.path.clone(), mode);
+                let shared_output = (Some(device.path.as_str()) == selected_path)
+                    .then(|| self.shared_hid_output.clone())
+                    .flatten();
+                desired.insert(device.path.clone(), (device.clone(), mode, shared_output));
             }
         }
 
-        self.qmk_hid_hosts
-            .retain(|path, bridge| desired.get(path).copied() == Some(bridge.mode()));
+        self.qmk_hid_hosts.retain(|path, bridge| {
+            desired.get(path).is_some_and(|(_, mode, shared_output)| {
+                *mode == bridge.mode() && shared_output.is_some() == bridge.uses_shared_output()
+            })
+        });
 
-        for (path, mode) in desired {
-            self.qmk_hid_hosts
-                .entry(path.clone())
-                .or_insert_with(|| crate::qmk_hid_host::QmkHidHostBridge::start(path, mode));
+        for (path, (device, mode, shared_output)) in desired {
+            self.qmk_hid_hosts.entry(path).or_insert_with(|| {
+                crate::qmk_hid_host::QmkHidHostBridge::start(device, mode, shared_output)
+            });
         }
     }
 
@@ -2298,6 +2310,43 @@ mod tests {
         assert!(!active.time);
         assert!(!active.volume);
         assert!(!active.media);
+    }
+
+    #[test]
+    fn selected_live_features_reuse_the_connected_hid_owner() {
+        let ctx = egui::Context::default();
+        let creation_context = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = EntropyApp::new(&creation_context);
+        let device = crate::device::Device {
+            name: "K:04".to_owned(),
+            vendor_id: 0xE126,
+            product_id: 0x0074,
+            manufacturer: "Ergohaven".to_owned(),
+            serial_number: "test".to_owned(),
+            bus_type: "Bluetooth".to_owned(),
+            path: "test-shared-live-features".to_owned(),
+            firmware: FirmwareProtocol::Vial,
+        };
+        let mut layout = test_layout_with_encoders(&[]);
+        layout.custom_keycodes = vec![crate::keyboard::CustomKeycode {
+            name: "LG_SYNC".to_owned(),
+            label: "RuEn\nSync".to_owned(),
+            title: "Sync language".to_owned(),
+        }];
+        let (hid, _) = crate::hid::HidDevice::test_device();
+
+        app.device_manager.replace_devices(vec![device.clone()]);
+        app.selected_device = Some(0);
+        app.layout = Some(layout);
+        app.app_settings.layout_sync_enabled = true;
+        app.shared_hid_output = hid.shared_output();
+        app.hid_device = Some(hid);
+
+        app.sync_qmk_hid_host_bridges();
+
+        let bridge = app.qmk_hid_hosts.get(&device.path).unwrap();
+        assert!(bridge.uses_shared_output());
+        app.qmk_hid_hosts.clear();
     }
 
     #[test]

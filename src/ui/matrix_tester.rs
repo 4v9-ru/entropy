@@ -11,7 +11,10 @@ impl EntropyApp {
     }
 
     fn matrix_tester_poll_interval(&self) -> std::time::Duration {
-        matrix_tester_poll_interval_for_transport(self.matrix_tester_uses_bluetooth_transport())
+        matrix_tester_poll_interval_for_target(
+            self.matrix_tester_uses_bluetooth_transport(),
+            cfg!(target_os = "macos"),
+        )
     }
 
     pub(super) fn reset_matrix_tester_state(&mut self) {
@@ -81,17 +84,12 @@ impl EntropyApp {
         if self.is_vial_locked() {
             return;
         }
-        #[cfg(target_os = "windows")]
-        if self.matrix_tester_uses_bluetooth_transport() {
-            self.matrix_tester_pressed.clear();
-            return;
-        }
-
         let now = std::time::Instant::now();
         let poll_interval = self.matrix_tester_poll_interval();
 
-        #[cfg(not(target_os = "windows"))]
-        if self.matrix_tester_uses_bluetooth_transport() {
+        if matrix_tester_poll_mode_for_transport(self.matrix_tester_uses_bluetooth_transport())
+            == MatrixTesterPollMode::Background
+        {
             if now.duration_since(self.matrix_tester_last_poll) >= poll_interval {
                 match self.start_vial_matrix_poll(ctx, rows, cols, remember_ever_pressed) {
                     VialHidTaskStart::Started => {
@@ -402,11 +400,33 @@ impl EntropyApp {
     }
 }
 
-fn matrix_tester_poll_interval_for_transport(bluetooth: bool) -> std::time::Duration {
-    if bluetooth {
+fn matrix_tester_poll_interval_for_target(
+    bluetooth: bool,
+    target_is_macos: bool,
+) -> std::time::Duration {
+    if bluetooth && !target_is_macos {
         MATRIX_TESTER_BLUETOOTH_POLL_INTERVAL
     } else {
+        // macOS already keeps a 16 ms visible Bluetooth repaint cadence and
+        // serializes Vial HID operations. Avoid holding fast BLE matrix
+        // round-trips to an 80 ms request cadence.
         MATRIX_TESTER_POLL_INTERVAL
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MatrixTesterPollMode {
+    Inline,
+    Background,
+}
+
+fn matrix_tester_poll_mode_for_transport(bluetooth: bool) -> MatrixTesterPollMode {
+    // BLE Vial round-trips can block on every desktop OS. Keep them on the
+    // serialized background HID worker so live tools remain responsive.
+    if bluetooth {
+        MatrixTesterPollMode::Background
+    } else {
+        MatrixTesterPollMode::Inline
     }
 }
 
@@ -415,9 +435,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bluetooth_matrix_polling_is_paced_for_ble() {
+    fn macos_bluetooth_matrix_polling_keeps_realtime_cadence() {
         assert_eq!(
-            matrix_tester_poll_interval_for_transport(true),
+            matrix_tester_poll_interval_for_target(true, true),
+            std::time::Duration::from_millis(16)
+        );
+    }
+
+    #[test]
+    fn other_bluetooth_matrix_polling_keeps_paced_cadence() {
+        assert_eq!(
+            matrix_tester_poll_interval_for_target(true, false),
             std::time::Duration::from_millis(80)
         );
     }
@@ -425,8 +453,28 @@ mod tests {
     #[test]
     fn usb_matrix_polling_keeps_realtime_cadence() {
         assert_eq!(
-            matrix_tester_poll_interval_for_transport(false),
+            matrix_tester_poll_interval_for_target(false, false),
             std::time::Duration::from_millis(16)
+        );
+        assert_eq!(
+            matrix_tester_poll_interval_for_target(false, true),
+            std::time::Duration::from_millis(16)
+        );
+    }
+
+    #[test]
+    fn bluetooth_matrix_polling_uses_the_background_hid_worker_on_every_desktop() {
+        assert_eq!(
+            matrix_tester_poll_mode_for_transport(true),
+            MatrixTesterPollMode::Background
+        );
+    }
+
+    #[test]
+    fn usb_matrix_polling_stays_inline() {
+        assert_eq!(
+            matrix_tester_poll_mode_for_transport(false),
+            MatrixTesterPollMode::Inline
         );
     }
 }
