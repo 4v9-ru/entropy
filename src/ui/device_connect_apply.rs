@@ -113,6 +113,15 @@ mod tests {
     }
 
     #[test]
+    fn fresh_pairing_timeout_is_classified_as_a_disconnect() {
+        let error = "VIA protocol read failed: HID notification probe failed: \
+            HID timeout — device did not respond; Get Input Report fallback failed: \
+            hidapi error: ioctl (GINPUT): EIO: I/O error";
+
+        assert!(crate::hid::is_disconnect_error_message(error));
+    }
+
+    #[test]
     fn empty_connect_poll_is_throttled() {
         assert_eq!(CONNECT_POLL_INTERVAL, std::time::Duration::from_millis(250));
     }
@@ -418,7 +427,9 @@ impl EntropyApp {
                     }
                 }
             },
-            ConnectState::Idle | ConnectState::Reconnecting(_) => return,
+            ConnectState::Idle | ConnectState::SelectingDevice | ConnectState::Reconnecting(_) => {
+                return
+            }
         };
 
         self.connect_state = ConnectState::Idle;
@@ -429,7 +440,7 @@ impl EntropyApp {
 
         match result {
             Ok(mut r) => {
-                if reconnect.is_some() {
+                if reconnect.is_some() && self.layout.is_some() {
                     self.preserve_deferred_snapshot_on_reconnect(&mut r);
                 }
                 let staged_bluetooth_load = r.deferred_load.is_staged();
@@ -549,6 +560,8 @@ impl EntropyApp {
                 self.keycode_picker.macro_descriptions = macro_metadata.descriptions;
                 self.keycode_picker.macro_metadata_dirty = false;
                 self.keycode_picker.supports_macro_ext_keycodes = r.supports_macro_ext_keycodes;
+                self.keycode_picker.supports_rmk_native_key_actions =
+                    r.supports_rmk_native_key_actions;
                 self.keycode_picker.macro_ext_keycodes_disabled_reason =
                     r.macro_ext_keycodes_disabled_reason;
                 // Parse macro texts into actions (Vial protocol v2+ bytecode).
@@ -577,7 +590,7 @@ impl EntropyApp {
 
                 let encoder_count = r.layout.encoder_count();
                 let hide_modular_encoders_by_default =
-                    self.module_settings_include_encoder_visibility(&r.layout);
+                    self.hide_modular_encoders_by_default(&r.layout);
                 self.encoder_visibility = Self::resolve_initial_encoder_visibility(
                     &r.layout,
                     self.layout_options_value,
@@ -662,6 +675,12 @@ impl EntropyApp {
             Err(e) => {
                 if let Some(reconnect) = reconnect {
                     self.schedule_bluetooth_reconnect_retry(reconnect, &e);
+                    return;
+                }
+
+                if crate::hid::is_disconnect_error_message(&e)
+                    && self.begin_bluetooth_reconnect(e.clone())
+                {
                     return;
                 }
 
