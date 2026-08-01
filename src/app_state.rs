@@ -32,6 +32,8 @@ pub(crate) struct AppSettings {
     pub(crate) close_to_tray_behavior: CloseToTrayBehavior,
     #[serde(default)]
     pub(crate) launch_at_startup: bool,
+    #[serde(default)]
+    pub(crate) launch_minimized: bool,
     #[serde(default = "default_show_shifted_number_symbols")]
     pub(crate) show_shifted_number_symbols: bool,
     #[serde(default = "default_layer_hover_preview")]
@@ -163,6 +165,7 @@ impl Default for AppSettings {
             minimize_to_tray_on_close: false,
             close_to_tray_behavior: CloseToTrayBehavior::Ask,
             launch_at_startup: false,
+            launch_minimized: false,
             show_shifted_number_symbols: default_show_shifted_number_symbols(),
             layer_hover_preview: default_layer_hover_preview(),
             sticky_layout_window: false,
@@ -214,6 +217,7 @@ mod app_settings_tests {
         let settings: AppSettings = serde_json::from_str(r#"{"language":"english"}"#).unwrap();
 
         assert!(!settings.dark_mode);
+        assert!(!settings.launch_minimized);
     }
 }
 
@@ -284,18 +288,11 @@ pub(crate) fn key_binding_label_with_macro_names(
             key_legend_layout,
         ),
         crate::keyboard::KeyBinding::Rmk(action) => {
-            use rmk_types::action::{Action, KeyAction};
-            if let KeyAction::TapHold(
-                Action::KeyWithModifier(key, tap_mods),
-                Action::Modifier(hold_mods),
-                _,
-            ) = action
-            {
-                let tap_value = ((tap_mods.into_packed_bits() as u16) << 8) | key as u16;
+            if let Some(parts) = crate::rmk_native::rmk_mod_tap_parts(action) {
                 let hold =
-                    crate::keycode::modifier_label_from_bits(hold_mods.into_packed_bits() as u16);
+                    crate::keycode::modifier_label_from_bits(parts.hold_modifier_bits() as u16);
                 let tap = keycode_label_with_names_and_layout(
-                    tap_value,
+                    parts.tap_value(),
                     custom,
                     layer_names,
                     key_legend_layout,
@@ -325,24 +322,19 @@ pub(crate) fn key_binding_tooltip_with_macro_names(
             tap_dance_names,
         ),
         crate::keyboard::KeyBinding::Rmk(action) => {
-            use rmk_types::action::{Action, KeyAction};
-            if let KeyAction::TapHold(
-                Action::KeyWithModifier(key, tap_mods),
-                Action::Modifier(hold_mods),
-                _,
-            ) = action
-            {
-                let tap_value = ((tap_mods.into_packed_bits() as u16) << 8) | key as u16;
+            if let Some(parts) = crate::rmk_native::rmk_mod_tap_parts(action) {
                 let hold =
-                    crate::keycode::modifier_label_from_bits(hold_mods.into_packed_bits() as u16);
+                    crate::keycode::modifier_label_from_bits(parts.hold_modifier_bits() as u16);
                 let tap = keycode_label_with_names_and_layout(
-                    tap_value,
+                    parts.tap_value(),
                     custom,
                     layer_names,
                     KeyLegendLayout::English,
                 )
                 .replace('\n', " ");
-                return format!("RMK Mod Tap — tap for {tap}, hold for {hold}");
+                return format!(
+                    "RMK Mod Tap — tap for {tap}, hold for {hold}\nRight click to change tap key\nCtrl+right-click to switch left/right side"
+                );
             }
             format!("Native RMK key action: {action:?}")
         }
@@ -1552,6 +1544,10 @@ pub(crate) struct ModuleSettingField {
     pub(crate) qsid: u16,
     pub(crate) kind: ModuleSettingKind,
     pub(crate) bit: u8,
+    /// Boolean firmware setting that owns a Vial layout-display option.
+    /// When present, Entropy derives that option from this setting instead of
+    /// exposing a second manual control under Display Presets.
+    pub(crate) layout_option: Option<usize>,
     pub(crate) width: u8,
     pub(crate) min: u16,
     pub(crate) max: u16,
@@ -1778,6 +1774,23 @@ impl std::fmt::Display for ModuleSettingWritebackError {
 }
 
 impl ModuleSettingsState {
+    pub(crate) fn is_trackball_page(&self) -> bool {
+        let mut has_trackball_group = false;
+        let only_trackball_groups = self.groups.iter().all(|group| match group.kind {
+            ModuleSettingsGroupKind::AutoLayer => true,
+            ModuleSettingsGroupKind::Other => {
+                let is_trackball = group
+                    .title
+                    .split(|character: char| !character.is_ascii_alphanumeric())
+                    .any(|word| word.eq_ignore_ascii_case("trackball"));
+                has_trackball_group |= is_trackball;
+                is_trackball
+            }
+            ModuleSettingsGroupKind::Left | ModuleSettingsGroupKind::Right => false,
+        });
+        has_trackball_group && only_trackball_groups
+    }
+
     pub(crate) fn selected_module_group(&self) -> Option<usize> {
         let selected = self.groups.get(self.selected_module_group)?;
         if matches!(
@@ -3846,7 +3859,7 @@ pub struct EntropyApp {
     /// Set when secondary click was handled by a key (prevents global jump-back)
     pub(crate) secondary_click_handled: bool,
     /// Deferred left/right modifier swap, applied after Ctrl is released
-    pub(crate) pending_handed_swap: Option<(usize, usize, u16)>,
+    pub(crate) pending_handed_swap: Option<(usize, usize, crate::keyboard::KeyBinding)>,
     /// Animation progress for hover layer preview (0.0 = hidden, 1.0 = fully shown)
     pub(crate) hover_layer_progress: f32,
     /// Stack of layers to return to on right-click (last = most recent)

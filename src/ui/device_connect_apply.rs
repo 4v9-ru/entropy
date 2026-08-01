@@ -471,7 +471,7 @@ impl EntropyApp {
                 if staged_bluetooth_load {
                     self.schedule_initial_battery_refresh();
                 } else {
-                    self.schedule_next_battery_refresh();
+                    self.schedule_battery_refresh_for_result(r.about_info.battery_halves);
                 }
                 self.matrix_tester_rmk_byte_order = self.current_device_is_likely_rmk();
                 self.current_encoder_visibility_id =
@@ -646,6 +646,7 @@ impl EntropyApp {
                 self.sticky_layout_active_layer = 0;
 
                 self.layout = Some(r.layout);
+                self.sync_firmware_managed_layout_options();
                 self.refresh_layer_picker_content_flags();
 
                 // Keep the same HID owner that loaded the keyboard, matching vial-gui's
