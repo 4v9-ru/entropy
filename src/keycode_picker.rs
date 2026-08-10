@@ -138,6 +138,8 @@ pub struct KeycodePicker {
     pub supports_persistent_default_layer: bool,
     pub supports_macro_ext_keycodes: bool,
     pub supports_rmk_native_key_actions: bool,
+    pub supports_universal_symbols: bool,
+    pub supports_universal_russian_letters: bool,
     pub rmk_native_key_actions_allowed_for_target: bool,
     pub macro_ext_keycodes_disabled_reason: Option<MacroExtKeycodesDisabledReason>,
     pub layer_names: Vec<String>,
@@ -175,6 +177,11 @@ pub struct KeycodePicker {
     pub macro_actions: Vec<Vec<MacroAction>>,
     /// Flag: macro texts changed, need to write to device
     pub macros_dirty: bool,
+    /// Revision of the macro snapshot currently represented by `macro_texts`.
+    pub macro_edit_revision: u64,
+    /// Last revision attempted by the HID worker. A failed revision is not
+    /// retried until another edit creates a new snapshot.
+    pub macro_attempted_revision: Option<u64>,
     /// Undo stack for macro editor: (macro_idx, previous_actions)
     macro_undo_stack: Vec<(usize, Vec<MacroAction>)>,
     /// Macro key picker: (macro_idx, action_idx) being edited
@@ -190,19 +197,66 @@ fn tr_picker(language: crate::i18n::Language, key: &'static str) -> &'static str
     crate::i18n::tr_catalog(language, key)
 }
 
-const UNIVERSAL_MAIN_SYMBOL_ORDER: &[char] = &[
-    '.', ',', ';', ':', '!', '?', '/', '`', '~', '\'', '"', '(', ')', '[', ']', '{', '}', '<', '>',
-    '-', '+', '*', '=', '#', '@', '$', '%', '^', '&', '|', '\\', '_',
-];
-
-const UNIVERSAL_EXTRA_SYMBOL_ORDER: &[char] = &[
-    '₽', '€', '«', '»', '‘', '’', '„', '“', '”', '—', '–', '←', '↑', '→', '↓', '↔', '•', '×', '±',
-    '≠', '≈', '✓', '§', '°', '‰', '′', '″', '™', '№',
-];
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn macro_picker(selected: u8) -> KeycodePicker {
+        KeycodePicker {
+            selected_tab: KeycodeTab::Macro,
+            macro_count: 32,
+            macro_inline_selected: Some(selected),
+            macro_texts: vec![Vec::new(); 32],
+            macro_actions: vec![Vec::new(); 32],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn assigning_unchanged_macro_does_not_rewrite_macro_buffer() {
+        let mut picker = macro_picker(4);
+
+        picker.finalize_vial_special_tab_close();
+
+        assert_eq!(
+            picker.result.map(|binding| binding.vial_keycode()),
+            Some(0x7704)
+        );
+        assert!(!picker.macros_dirty);
+    }
+
+    #[test]
+    fn assigning_edited_macro_keeps_macro_buffer_dirty() {
+        let mut picker = macro_picker(4);
+        picker.macro_actions[4].push(MacroAction::Tap(0x0006));
+        assert!(picker.encode_macro(4));
+        picker.mark_macros_dirty();
+
+        picker.finalize_vial_special_tab_close();
+
+        assert_eq!(
+            picker.result.map(|binding| binding.vial_keycode()),
+            Some(0x7704)
+        );
+        assert!(picker.macros_dirty);
+        assert_eq!(picker.macro_texts[4], [0x01, 0x01, 0x06]);
+    }
+
+    #[test]
+    fn assigning_macro_never_reserializes_legacy_contents() {
+        let mut picker = macro_picker(4);
+        picker.macro_texts[4] = vec![0xAA, 0xBB];
+        picker.macro_actions[4] = vec![MacroAction::Text("different".to_owned())];
+
+        picker.finalize_vial_special_tab_close();
+
+        assert_eq!(
+            picker.result.map(|binding| binding.vial_keycode()),
+            Some(0x7704)
+        );
+        assert_eq!(picker.macro_texts[4], [0xAA, 0xBB]);
+        assert!(!picker.macros_dirty);
+    }
 
     fn collect_text(shape: &egui::Shape, text: &mut Vec<String>) {
         match shape {
@@ -219,16 +273,96 @@ mod tests {
     }
 
     #[test]
-    fn universal_extra_symbols_include_common_arrows() {
-        for symbol in ['←', '↑', '→', '↓', '↔'] {
-            assert!(UNIVERSAL_EXTRA_SYMBOL_ORDER.contains(&symbol));
+    fn universal_symbols_are_hidden_without_firmware_capability() {
+        let picker = KeycodePicker::default();
+        assert!(!picker.universal_symbols_available());
+
+        let supported = KeycodePicker {
+            supports_rmk_native_key_actions: true,
+            supports_universal_symbols: true,
+            supports_universal_russian_letters: true,
+            rmk_native_key_actions_allowed_for_target: true,
+            ..Default::default()
+        };
+        assert!(supported.universal_symbols_available());
+
+        for unsupported in [
+            KeycodePicker {
+                supports_rmk_native_key_actions: false,
+                supports_universal_symbols: true,
+                supports_universal_russian_letters: true,
+                rmk_native_key_actions_allowed_for_target: true,
+                ..Default::default()
+            },
+            KeycodePicker {
+                supports_rmk_native_key_actions: true,
+                supports_universal_symbols: false,
+                supports_universal_russian_letters: true,
+                rmk_native_key_actions_allowed_for_target: true,
+                ..Default::default()
+            },
+            KeycodePicker {
+                supports_rmk_native_key_actions: true,
+                supports_universal_symbols: true,
+                supports_universal_russian_letters: true,
+                rmk_native_key_actions_allowed_for_target: false,
+                ..Default::default()
+            },
+        ] {
+            assert!(!unsupported.universal_symbols_available());
         }
+
+        assert!(supported.universal_russian_letters_available());
+        assert!(!KeycodePicker {
+            supports_rmk_native_key_actions: true,
+            supports_universal_symbols: true,
+            supports_universal_russian_letters: false,
+            rmk_native_key_actions_allowed_for_target: true,
+            ..Default::default()
+        }
+        .universal_russian_letters_available());
     }
 
     #[test]
-    fn universal_main_symbols_include_hyphen_minus() {
-        assert_eq!(UNIVERSAL_MAIN_SYMBOL_ORDER.len(), 32);
-        assert!(UNIVERSAL_MAIN_SYMBOL_ORDER.contains(&'-'));
+    fn russian_universal_letter_reopens_on_special_tab() {
+        let mut picker = KeycodePicker::default();
+        picker.select_tab_for_binding(crate::universal_symbols::binding(
+            crate::universal_symbols::USER_RUSSIAN_LETTER_START,
+        ));
+        assert_eq!(picker.selected_tab, KeycodeTab::Special);
+    }
+
+    #[test]
+    fn universal_symbol_reopens_on_its_own_tab() {
+        let mut picker = KeycodePicker::default();
+        picker.select_tab_for_binding(crate::universal_symbols::binding(
+            crate::universal_symbols::USER_SYMBOL_START,
+        ));
+        assert_eq!(picker.selected_tab, KeycodeTab::UniversalSymbols);
+    }
+
+    #[test]
+    fn universal_symbols_tab_is_gated_and_follows_symbols() {
+        let unsupported = KeycodePicker::default();
+        assert!(!unsupported
+            .visible_vial_tabs()
+            .contains(&KeycodeTab::UniversalSymbols));
+
+        let supported = KeycodePicker {
+            supports_rmk_native_key_actions: true,
+            supports_universal_symbols: true,
+            rmk_native_key_actions_allowed_for_target: true,
+            ..Default::default()
+        };
+        let tabs = supported.visible_vial_tabs();
+        let symbols_index = tabs
+            .iter()
+            .position(|tab| *tab == KeycodeTab::Symbols)
+            .expect("Symbols tab should be visible");
+        assert_eq!(
+            tabs.get(symbols_index + 1),
+            Some(&KeycodeTab::UniversalSymbols)
+        );
     }
 
     #[test]
@@ -382,50 +516,51 @@ mod tests {
 fn show_universal_symbol_section(
     ui: &mut egui::Ui,
     language: crate::i18n::Language,
-    section_key: &'static str,
-    symbols: &[char],
-    show_setup_hint: bool,
-) -> Option<u16> {
+) -> Option<crate::keyboard::KeyBinding> {
     let mut picked = None;
 
     ui.label(
-        RichText::new(tr_picker(language, section_key))
+        RichText::new(tr_picker(language, "key_picker.section_universal_symbols"))
             .size(11.0)
             .color(Color32::from_gray(150)),
     );
-    if show_setup_hint {
-        if let Some(hint) = crate::smart_input::universal_output_setup_hint() {
-            ui.add_space(3.0);
-            ui.label(
-                RichText::new(crate::i18n::tr_text(language, hint))
-                    .size(10.0)
-                    .color(Color32::from_gray(120)),
-            );
-        }
-    }
     ui.add_space(4.0);
     ui.horizontal_wrapped(|ui| {
-        for wanted in symbols {
-            let Some(smart) = crate::smart_input::SMART_SYMBOLS
-                .iter()
-                .copied()
-                .find(|smart| smart.symbol == *wanted)
-            else {
-                continue;
-            };
-            let label = smart.symbol.to_string();
-            let tip = format!(
-                "Universal symbol: {} — types {} consistently regardless of the active keyboard language",
-                smart.name, smart.symbol
-            );
+        for control in crate::universal_symbols::CONTROLS {
+            let label = crate::universal_symbols::label_for_user_id(control.user_id)
+                .expect("universal symbol control should have a display label");
             let resp = ui
-                .add_sized(KeycodePicker::picker_key_size(ui.ctx()), egui::Button::new(""))
+                .add_sized(
+                    KeycodePicker::picker_key_size(ui.ctx()),
+                    egui::Button::new(""),
+                )
                 .on_hover_cursor(egui::CursorIcon::PointingHand);
             KeycodePicker::paint_compact_picker_label(ui, &resp, &label);
             if resp.clicked() {
-                picked = Some(smart.trigger_keycode);
+                picked = Some(crate::universal_symbols::binding(control.user_id));
             }
-            resp.on_hover_text(crate::i18n::tr_text(language, &tip));
+            resp.on_hover_text(crate::i18n::tr_text(language, control.name));
+        }
+        for symbol in crate::universal_symbols::SYMBOLS {
+            let label = crate::universal_symbols::label_for_user_id(symbol.user_id)
+                .expect("universal symbol should have a display label");
+            let resp = ui
+                .add_sized(
+                    KeycodePicker::picker_key_size(ui.ctx()),
+                    egui::Button::new(""),
+                )
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            KeycodePicker::paint_compact_picker_label(ui, &resp, &label);
+            if resp.clicked() {
+                picked = Some(crate::universal_symbols::binding(symbol.user_id));
+            }
+            resp.on_hover_text(crate::i18n::tr_text(
+                language,
+                &format!(
+                    "Universal Symbols: firmware types {} in English and Russian layouts",
+                    symbol.symbol
+                ),
+            ));
         }
     });
 
@@ -590,6 +725,8 @@ impl Default for KeycodePicker {
             supports_persistent_default_layer: true,
             supports_macro_ext_keycodes: true,
             supports_rmk_native_key_actions: false,
+            supports_universal_symbols: false,
+            supports_universal_russian_letters: false,
             rmk_native_key_actions_allowed_for_target: false,
             macro_ext_keycodes_disabled_reason: None,
             layer_names: (0..16).map(|i| i.to_string()).collect(),
@@ -619,6 +756,8 @@ impl Default for KeycodePicker {
             macro_undo_stack: Vec::new(),
             macro_key_pick: None,
             macros_dirty: false,
+            macro_edit_revision: 0,
+            macro_attempted_revision: None,
             popup_state: PopupState::default(),
             language: crate::i18n::default_language(),
             key_legend_layout: KeyLegendLayout::default(),
@@ -629,6 +768,29 @@ impl Default for KeycodePicker {
 }
 
 impl KeycodePicker {
+    pub(crate) fn mark_macros_dirty(&mut self) {
+        self.macros_dirty = true;
+        self.macro_edit_revision = self.macro_edit_revision.wrapping_add(1);
+        self.macro_attempted_revision = None;
+    }
+
+    pub(crate) fn mark_macros_clean(&mut self) {
+        self.macros_dirty = false;
+        self.macro_attempted_revision = None;
+    }
+
+    fn universal_symbols_available(&self) -> bool {
+        self.supports_universal_symbols
+            && self.supports_rmk_native_key_actions
+            && self.rmk_native_key_actions_allowed_for_target
+    }
+
+    fn universal_russian_letters_available(&self) -> bool {
+        self.supports_universal_russian_letters
+            && self.supports_rmk_native_key_actions
+            && self.rmk_native_key_actions_allowed_for_target
+    }
+
     fn picker_keycode_tooltip(
         &self,
         value: u16,
@@ -666,7 +828,7 @@ impl KeycodePicker {
         }
         if changed {
             self.encode_macro(macro_idx);
-            self.macros_dirty = true;
+            self.mark_macros_dirty();
         }
         self.macro_key_pick = None;
     }
@@ -777,9 +939,7 @@ impl KeycodePicker {
         if self.selected_tab == KeycodeTab::Macro {
             if let Some(raw_n) = self.macro_inline_selected {
                 if (raw_n as usize) < self.macro_count {
-                    self.encode_macro(raw_n as usize);
                     self.result = Some((0x7700 + raw_n as u16).into());
-                    self.macros_dirty = true;
                 }
             }
         }
@@ -867,6 +1027,16 @@ impl KeycodePicker {
             crate::keyboard::KeyBinding::Vial(value) => self.select_tab_for_keycode(value),
             crate::keyboard::KeyBinding::Rmk(rmk_types::action::KeyAction::TapHold(_, _, _)) => {
                 self.selected_tab = KeycodeTab::Modifiers
+            }
+            crate::keyboard::KeyBinding::Rmk(action)
+                if crate::universal_symbols::russian_letter_user_id(action).is_some() =>
+            {
+                self.selected_tab = KeycodeTab::Special
+            }
+            crate::keyboard::KeyBinding::Rmk(action)
+                if crate::universal_symbols::user_id(action).is_some() =>
+            {
+                self.selected_tab = KeycodeTab::UniversalSymbols
             }
             crate::keyboard::KeyBinding::Rmk(_) => self.selected_tab = KeycodeTab::Basic,
         }
@@ -1146,12 +1316,7 @@ impl KeycodePicker {
             }
 
             // Tab bar
-            let tabs = KeycodeTab::VIAL_TABS;
-            let visible_tabs: Vec<KeycodeTab> = tabs
-                .iter()
-                .copied()
-                .filter(|tab| self.vial_tab_supported(*tab))
-                .collect();
+            let visible_tabs = self.visible_vial_tabs();
             let tab_spacing = 6.0;
             let tab_bar_width: f32 = visible_tabs
                 .iter()
@@ -1662,12 +1827,21 @@ impl KeycodePicker {
 
     fn vial_tab_supported(&self, tab: KeycodeTab) -> bool {
         match tab {
+            KeycodeTab::UniversalSymbols => self.universal_symbols_available(),
             KeycodeTab::Rgb => self.supports_rgb,
             KeycodeTab::Macro => self.supports_macro,
             KeycodeTab::TapDance => self.supports_tap_dance,
             KeycodeTab::Custom => self.has_visible_custom_keycodes(),
             _ => true,
         }
+    }
+
+    fn visible_vial_tabs(&self) -> Vec<KeycodeTab> {
+        KeycodeTab::VIAL_TABS
+            .iter()
+            .copied()
+            .filter(|tab| self.vial_tab_supported(*tab))
+            .collect()
     }
 
     fn vial_keycode_supported(&self, kc: &crate::keycode::Keycode) -> bool {
@@ -1739,6 +1913,7 @@ impl KeycodePicker {
         match self.selected_tab {
             KeycodeTab::Basic => self.show_vial_basic(ui),
             KeycodeTab::Symbols => self.show_vial_symbols(ui),
+            KeycodeTab::UniversalSymbols => self.show_vial_universal_symbols(ui),
             KeycodeTab::Layers => self.show_vial_layers(ui),
             KeycodeTab::Modifiers => self.show_vial_modifiers(ui),
             KeycodeTab::Rgb => self.show_vial_rgb(ui),

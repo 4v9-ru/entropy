@@ -1,6 +1,8 @@
 //! Small built-in qmk-hid-host bridge for display presets that expect host data.
 //! Sends the same Raw HID packet family as https://github.com/ergohaven/qmk-hid-host.
 
+#[cfg(target_os = "linux")]
+use std::sync::OnceLock;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -15,6 +17,19 @@ const DATA_LAYOUT: u8 = 0xAC;
 const DATA_MEDIA_ARTIST: u8 = 0xAD;
 const DATA_MEDIA_TITLE: u8 = 0xAE;
 const DEFAULT_LAYOUT_CODES: [&str; 2] = ["en", "ru"];
+const LAYOUT_RESEND_INTERVAL: Duration = Duration::from_secs(10);
+#[cfg(target_os = "linux")]
+const KDE_LAYOUT_DESTINATION: &str = "org.kde.keyboard";
+#[cfg(target_os = "linux")]
+const KDE_LAYOUT_PATH: &str = "/Layouts";
+#[cfg(target_os = "linux")]
+const KDE_LAYOUT_INTERFACE: &str = "org.kde.KeyboardLayouts";
+#[cfg(target_os = "linux")]
+const IBUS_DESTINATION: &str = "org.freedesktop.IBus";
+#[cfg(target_os = "linux")]
+const IBUS_PATH: &str = "/org/freedesktop/IBus";
+#[cfg(target_os = "linux")]
+const IBUS_INTERFACE: &str = "org.freedesktop.IBus";
 #[cfg(target_os = "macos")]
 const MACOS_AUTOMATION_COMMAND_TIMEOUT: Duration = Duration::from_millis(1_500);
 #[cfg(not(target_os = "windows"))]
@@ -165,7 +180,25 @@ fn platform_layout_check() -> FeatureCheck {
 
 #[cfg(target_os = "linux")]
 fn platform_layout_check() -> FeatureCheck {
-    if std::env::var_os("DISPLAY").is_some() && x11_dl::xlib::Xlib::open().is_ok() {
+    if kde_layout_available() {
+        FeatureCheck {
+            ok: true,
+            label: "KDE Plasma / D-Bus",
+            hint: "Uses the active KDE keyboard layout on Wayland and X11",
+        }
+    } else if gnome_ibus_layout_available() {
+        FeatureCheck {
+            ok: true,
+            label: "GNOME / IBus D-Bus",
+            hint: "Uses the active GNOME keyboard layout on Wayland and X11",
+        }
+    } else if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        FeatureCheck {
+            ok: false,
+            label: "unsupported Wayland session",
+            hint: "Wayland Layout Sync is currently available on GNOME and KDE Plasma",
+        }
+    } else if std::env::var_os("DISPLAY").is_some() && x11_dl::xlib::Xlib::open().is_ok() {
         FeatureCheck {
             ok: true,
             label: "X11 / XKB",
@@ -175,9 +208,21 @@ fn platform_layout_check() -> FeatureCheck {
         FeatureCheck {
             ok: false,
             label: "missing X11 / XKB",
-            hint: "Layout sync currently needs an X11 session",
+            hint: "Layout Sync needs GNOME, KDE Plasma or an X11 session",
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn kde_layout_available() -> bool {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| KdeLayoutTracker::new().is_some())
+}
+
+#[cfg(target_os = "linux")]
+fn gnome_ibus_layout_available() -> bool {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| GnomeIbusLayoutTracker::new().is_some())
 }
 
 #[cfg(target_os = "macos")]
@@ -283,6 +328,7 @@ fn run_bridge(
     let mut last_layout_poll = Instant::now() - Duration::from_secs(60);
     let mut last_media_poll = Instant::now() - Duration::from_secs(60);
     let mut last_media_full_send = Instant::now() - Duration::from_secs(60);
+    let mut last_layout_full_send = Instant::now();
     let mut last_layout_tracker_attempt = Instant::now() - Duration::from_secs(60);
     let mut layout_tracker = mode.layout.then(LayoutTracker::new).flatten();
 
@@ -293,6 +339,7 @@ fn run_bridge(
                 .map_err(|e| log::warn!("qmk-hid-host open failed: {e}"))
                 .ok();
             if device.is_some() {
+                reset_layout_sync_state(&mut last_layout, &mut last_layout_full_send);
                 log::info!(
                     "qmk-hid-host bridge started ({})",
                     if device.as_ref().is_some_and(HostDataHid::uses_shared_output) {
@@ -316,6 +363,7 @@ fn run_bridge(
         if !target.uses_bluez_gatt_transport() && !std::path::Path::new(&target.path).exists() {
             log::warn!("qmk-hid-host device path disappeared; reconnecting");
             device = None;
+            reset_layout_sync_state(&mut last_layout, &mut last_layout_full_send);
             thread::sleep(Duration::from_millis(250));
             continue;
         }
@@ -355,9 +403,13 @@ fn run_bridge(
                 .as_mut()
                 .and_then(LayoutTracker::current_layout_index)
             {
-                if last_layout != Some(layout) {
+                if layout_needs_send(last_layout, last_layout_full_send.elapsed(), layout) {
                     last_layout = Some(layout);
-                    write_failed |= write_payload(dev, &[DATA_LAYOUT, layout]).is_err();
+                    let layout_write = write_payload(dev, &[DATA_LAYOUT, layout]);
+                    write_failed |= layout_write.is_err();
+                    if layout_write.is_ok() {
+                        last_layout_full_send = Instant::now();
+                    }
                     pause_between_packets();
                 }
             }
@@ -390,7 +442,7 @@ fn run_bridge(
             device = None;
             last_time = None;
             last_volume = None;
-            last_layout = None;
+            reset_layout_sync_state(&mut last_layout, &mut last_layout_full_send);
             last_artist.clear();
             last_title.clear();
             last_media_full_send = Instant::now() - Duration::from_secs(60);
@@ -400,6 +452,19 @@ fn run_bridge(
     }
 
     log::info!("qmk-hid-host bridge stopped");
+}
+
+fn reset_layout_sync_state(last_layout: &mut Option<u8>, last_layout_full_send: &mut Instant) {
+    *last_layout = None;
+    *last_layout_full_send = Instant::now();
+}
+
+fn layout_needs_send(
+    last_layout: Option<u8>,
+    elapsed_since_last_send: Duration,
+    layout: u8,
+) -> bool {
+    last_layout != Some(layout) || elapsed_since_last_send >= LAYOUT_RESEND_INTERVAL
 }
 
 fn send_shutdown_payloads(
@@ -779,6 +844,78 @@ mod tests {
     }
 
     #[test]
+    fn layout_resend_is_due_when_the_layout_does_not_change() {
+        let layout = 1;
+
+        assert!(!layout_needs_send(Some(layout), Duration::ZERO, layout));
+        assert!(layout_needs_send(
+            Some(layout),
+            LAYOUT_RESEND_INTERVAL,
+            layout
+        ));
+    }
+
+    #[test]
+    fn reset_layout_sync_state_forces_the_next_layout_write() {
+        let layout = 1;
+        let mut last_layout = Some(layout);
+        let mut last_layout_full_send = Instant::now();
+
+        reset_layout_sync_state(&mut last_layout, &mut last_layout_full_send);
+
+        assert!(layout_needs_send(
+            last_layout,
+            last_layout_full_send.elapsed(),
+            layout
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kde_layout_index_maps_configured_layout_order() {
+        let layouts = vec!["us".to_owned(), "ru".to_owned()];
+        assert_eq!(kde_layout_code_index(0, &layouts), Some(0));
+        assert_eq!(kde_layout_code_index(1, &layouts), Some(1));
+        assert_eq!(kde_layout_code_index(2, &layouts), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gnome_desktop_names_are_recognized_without_matching_other_desktops() {
+        assert!(desktop_list_has_gnome("GNOME"));
+        assert!(desktop_list_has_gnome("ubuntu:GNOME"));
+        assert!(desktop_list_has_gnome("GNOME-Classic:GNOME"));
+        assert!(!desktop_list_has_gnome("KDE"));
+        assert!(!desktop_list_has_gnome("NotGnome"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ibus_engine_descriptor_maps_its_layout_field() {
+        let engine: zbus::zvariant::OwnedValue = zbus::zvariant::StructureBuilder::new()
+            .add_field("IBusEngineDesc")
+            .add_field("")
+            .add_field("xkb:ru::rus")
+            .add_field("Russian")
+            .add_field("Russian")
+            .add_field("ru")
+            .add_field("GPL")
+            .add_field("IBus")
+            .add_field("ibus-keyboard")
+            .add_field("ru")
+            .build()
+            .unwrap()
+            .try_into()
+            .unwrap();
+
+        assert_eq!(ibus_engine_layout(&engine), Some("ru"));
+        assert_eq!(
+            ibus_engine_layout(&engine).and_then(layout_code_index),
+            Some(1)
+        );
+    }
+
+    #[test]
     fn command_stdout_timeout_returns_successful_output() {
         let output =
             command_stdout_timeout("/bin/sh", &["-c", "printf entropy"], Duration::from_secs(1));
@@ -835,7 +972,151 @@ mod tests {
 }
 
 #[cfg(target_os = "linux")]
-struct LayoutTracker {
+enum LayoutTracker {
+    Kde(KdeLayoutTracker),
+    GnomeIbus(GnomeIbusLayoutTracker),
+    X11(X11LayoutTracker),
+}
+
+#[cfg(target_os = "linux")]
+impl LayoutTracker {
+    fn new() -> Option<Self> {
+        if let Some(tracker) = KdeLayoutTracker::new() {
+            return Some(Self::Kde(tracker));
+        }
+        if let Some(tracker) = GnomeIbusLayoutTracker::new() {
+            return Some(Self::GnomeIbus(tracker));
+        }
+        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            return None;
+        }
+        X11LayoutTracker::new().map(Self::X11)
+    }
+
+    fn current_layout_index(&mut self) -> Option<u8> {
+        match self {
+            Self::Kde(tracker) => tracker.current_layout_index(),
+            Self::GnomeIbus(tracker) => tracker.current_layout_index(),
+            Self::X11(tracker) => tracker.current_layout_index(),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct KdeLayoutTracker {
+    connection: zbus::blocking::Connection,
+    layout_codes: Vec<String>,
+}
+
+#[cfg(target_os = "linux")]
+impl KdeLayoutTracker {
+    fn new() -> Option<Self> {
+        let connection = zbus::blocking::Connection::session().ok()?;
+        let layout_codes = {
+            let proxy = zbus::blocking::Proxy::new(
+                &connection,
+                KDE_LAYOUT_DESTINATION,
+                KDE_LAYOUT_PATH,
+                KDE_LAYOUT_INTERFACE,
+            )
+            .ok()?;
+            proxy
+                .call::<_, _, Vec<(String, String, String)>>("getLayoutsList", &())
+                .ok()?
+                .into_iter()
+                .map(|(short_name, _, _)| short_name)
+                .collect::<Vec<_>>()
+        };
+        if layout_codes.is_empty() {
+            return None;
+        }
+        Some(Self {
+            connection,
+            layout_codes,
+        })
+    }
+
+    fn current_layout_index(&mut self) -> Option<u8> {
+        let proxy = zbus::blocking::Proxy::new(
+            &self.connection,
+            KDE_LAYOUT_DESTINATION,
+            KDE_LAYOUT_PATH,
+            KDE_LAYOUT_INTERFACE,
+        )
+        .ok()?;
+        let layout = proxy.call::<_, _, u32>("getLayout", &()).ok()?;
+        kde_layout_code_index(layout, &self.layout_codes)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn kde_layout_code_index(layout: u32, layout_codes: &[String]) -> Option<u8> {
+    let raw = layout_codes.get(usize::try_from(layout).ok()?)?;
+    layout_code_index(raw)
+}
+
+#[cfg(target_os = "linux")]
+struct GnomeIbusLayoutTracker {
+    connection: zbus::blocking::Connection,
+}
+
+#[cfg(target_os = "linux")]
+impl GnomeIbusLayoutTracker {
+    fn new() -> Option<Self> {
+        if !gnome_desktop_session() {
+            return None;
+        }
+        let connection = zbus::blocking::connection::Builder::ibus()
+            .ok()?
+            .build()
+            .ok()?;
+        let mut tracker = Self { connection };
+        tracker.current_layout_index()?;
+        Some(tracker)
+    }
+
+    fn current_layout_index(&mut self) -> Option<u8> {
+        let proxy = zbus::blocking::Proxy::new(
+            &self.connection,
+            IBUS_DESTINATION,
+            IBUS_PATH,
+            IBUS_INTERFACE,
+        )
+        .ok()?;
+        let engine = proxy
+            .call::<_, _, zbus::zvariant::OwnedValue>("GetGlobalEngine", &())
+            .ok()?;
+        ibus_engine_layout(&engine).and_then(layout_code_index)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn ibus_engine_layout(engine: &zbus::zvariant::OwnedValue) -> Option<&str> {
+    let descriptor: &zbus::zvariant::Structure<'_> = engine.try_into().ok()?;
+    descriptor.fields().get(9)?.try_into().ok()
+}
+
+#[cfg(target_os = "linux")]
+fn gnome_desktop_session() -> bool {
+    ["XDG_CURRENT_DESKTOP", "XDG_SESSION_DESKTOP"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .filter_map(|value| value.into_string().ok())
+        .any(|value| desktop_list_has_gnome(&value))
+}
+
+#[cfg(target_os = "linux")]
+fn desktop_list_has_gnome(value: &str) -> bool {
+    value.split(':').any(|desktop| {
+        desktop.eq_ignore_ascii_case("gnome")
+            || desktop
+                .get(..6)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("gnome-"))
+    })
+}
+
+#[cfg(target_os = "linux")]
+struct X11LayoutTracker {
     xlib: x11_dl::xlib::Xlib,
     display: *mut x11_dl::xlib::Display,
     keyboard: x11_dl::xlib::XkbDescPtr,
@@ -843,7 +1124,7 @@ struct LayoutTracker {
 }
 
 #[cfg(target_os = "linux")]
-impl LayoutTracker {
+impl X11LayoutTracker {
     fn new() -> Option<Self> {
         unsafe {
             let xlib = x11_dl::xlib::Xlib::open().ok()?;
@@ -887,7 +1168,7 @@ impl LayoutTracker {
 }
 
 #[cfg(target_os = "linux")]
-impl Drop for LayoutTracker {
+impl Drop for X11LayoutTracker {
     fn drop(&mut self) {
         unsafe {
             if !self.keyboard.is_null() {

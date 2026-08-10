@@ -5,6 +5,47 @@ All notable public changes to Entropy are tracked here.
 Entropy uses public release versions for GitHub releases and internal build versions
 for development history. The first public beta is `v0.1.0-beta.1`.
 
+## v0.3.4 - Public Beta
+
+### Main Features
+
+- Added portable firmware settings to `.entlayout` files so supported device configuration can be exported and restored together with layouts
+- Restored explicit per-side K:04 module selection for None, Encoder, Trackball, and Touchpad instead of automatic module detection
+
+### Improvements
+
+- Made settings imports atomic, with structural legacy-field migration and rollback when applying imported application settings fails
+- Pinned and verified the Linux AppImage packaging tool and hardened update-download URL validation
+
+### Fixes
+
+- Kept left and right K:04 module readback aligned over Linux Bluetooth after reconnecting or reopening Entropy
+- Prevented optional firmware-version probes and disconnect handling from stalling device connections
+- Resent layout state after HID reconnect so the device view stays synchronized
+
+## v0.3.2-rc.1 - Public Beta
+
+### Main Features
+
+- Replaced application-injected Universal Symbols with firmware-native EN/RU punctuation actions on compatible RMK keyboards, with autonomous layout controls and optional Entropy Layout Sync
+- Added a dedicated firmware-gated Universal picker tab with consistent `Universal` keycap labels in the picker, layout, previews, and exports
+- Added firmware-native Russian `х`, `б`, `ю`, and `ъ` keys under Special > International
+
+### Improvements
+
+- Added native Universal Symbols layout tracking for KDE Plasma Wayland and GNOME Wayland
+- Removed the legacy F13-F24 symbol transport, desktop Unicode injection, and unsupported typography, arrows, math, and currency extras; Linux IBus remains only for Text Expander
+- Replaced direction arrows in Russian inversion-setting labels with text, enlarged circular encoder controls, and rendered macOS Command legends as `Cmd`
+- Added native macOS Layout Indicator opacity support
+
+### Fixes
+
+- Prevented a Linux Bluetooth startup panic caused by retaining references to stale HID reports
+- Rejected stale RMK native-action scan replies instead of aborting K:04 loading
+- Prevented cached Bluetooth encoder replies from being decoded as layer names during staged loading
+- Removed the long `Reading keymap…` delay on QMK-Vial keyboards when an unsupported RMK capabilities probe is echoed
+- Kept the layer-name hover cursor stable while Bluetooth layers load in the background
+
 ## v0.3.1 - Public Beta
 
 ### Main Features

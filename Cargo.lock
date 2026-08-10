@@ -1402,7 +1402,7 @@ dependencies = [
 
 [[package]]
 name = "ergohaven-entropy"
-version = "0.3.1"
+version = "0.3.4"
 dependencies = [
  "ab_glyph",
  "anyhow",
@@ -1430,6 +1430,7 @@ dependencies = [
  "serde_json",
  "tray-icon",
  "ureq",
+ "url",
  "wasm-bindgen-futures",
  "web-sys",
  "windows 0.56.0",

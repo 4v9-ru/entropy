@@ -288,6 +288,9 @@ pub(crate) fn key_binding_label_with_macro_names(
             key_legend_layout,
         ),
         crate::keyboard::KeyBinding::Rmk(action) => {
+            if let Some(label) = crate::universal_symbols::label(action) {
+                return label;
+            }
             if let Some(parts) = crate::rmk_native::rmk_mod_tap_parts(action) {
                 let hold =
                     crate::keycode::modifier_label_from_bits(parts.hold_modifier_bits() as u16);
@@ -322,6 +325,9 @@ pub(crate) fn key_binding_tooltip_with_macro_names(
             tap_dance_names,
         ),
         crate::keyboard::KeyBinding::Rmk(action) => {
+            if let Some(tooltip) = crate::universal_symbols::tooltip(action) {
+                return tooltip;
+            }
             if let Some(parts) = crate::rmk_native::rmk_mod_tap_parts(action) {
                 let hold =
                     crate::keycode::modifier_label_from_bits(parts.hold_modifier_bits() as u16);
@@ -514,6 +520,8 @@ pub(crate) struct DeferredDeviceLoadContext {
     pub(crate) rgb_supported: bool,
     pub(crate) lighting_mode: Option<String>,
     pub(crate) supports_rmk_native_key_actions: bool,
+    pub(crate) supports_universal_symbols: bool,
+    pub(crate) supports_universal_russian_letters: bool,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -557,6 +565,8 @@ impl DeferredDeviceLoadContext {
             && self.rgb_supported == other.rgb_supported
             && self.lighting_mode == other.lighting_mode
             && self.supports_rmk_native_key_actions == other.supports_rmk_native_key_actions
+            && self.supports_universal_symbols == other.supports_universal_symbols
+            && self.supports_universal_russian_letters == other.supports_universal_russian_letters
     }
 }
 
@@ -942,6 +952,10 @@ pub(crate) struct ConnectResult {
     pub(crate) supports_macro_ext_keycodes: bool,
     /// Firmware exposes the lossless RMK KeyAction Get/Set extension.
     pub(crate) supports_rmk_native_key_actions: bool,
+    /// Firmware implements native EN/RU Universal Symbols actions.
+    pub(crate) supports_universal_symbols: bool,
+    /// Firmware implements native Russian-letter Universal Symbols actions.
+    pub(crate) supports_universal_russian_letters: bool,
     pub(crate) macro_ext_keycodes_disabled_reason: Option<MacroExtKeycodesDisabledReason>,
     /// Tap dance entries
     pub(crate) tap_dance_entries: Vec<crate::keycode_picker::TapDanceEntry>,
@@ -1335,6 +1349,30 @@ pub(crate) struct AltRepeatKeyEntry {
     pub(crate) options: AltRepeatKeyOptionsState,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct QmkSettingValueSet {
+    words: [u64; 4],
+}
+
+impl QmkSettingValueSet {
+    pub(crate) fn mark(&mut self, qsid: u16) {
+        let word = usize::from(qsid) / u64::BITS as usize;
+        let bit = usize::from(qsid) % u64::BITS as usize;
+        if let Some(bits) = self.words.get_mut(word) {
+            *bits |= 1u64 << bit;
+        }
+    }
+
+    pub(crate) fn contains(self, qsid: u16) -> bool {
+        let word = usize::from(qsid) / u64::BITS as usize;
+        let bit = usize::from(qsid) % u64::BITS as usize;
+        self.words
+            .get(word)
+            .map(|bits| bits & (1u64 << bit) != 0)
+            .unwrap_or(false)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct AutoShiftOptionsState {
     pub(crate) enabled: bool,
@@ -1344,6 +1382,8 @@ pub(crate) struct AutoShiftOptionsState {
     pub(crate) no_alpha: bool,
     pub(crate) enable_keyrepeat: bool,
     pub(crate) disable_keyrepeat_timeout: bool,
+    /// Whether qsid 3 was read successfully or acknowledged by the firmware.
+    pub(crate) loaded: bool,
 }
 
 impl AutoShiftOptionsState {
@@ -1356,6 +1396,7 @@ impl AutoShiftOptionsState {
             no_alpha: bits & (1 << 4) != 0,
             enable_keyrepeat: bits & (1 << 5) != 0,
             disable_keyrepeat_timeout: bits & (1 << 6) != 0,
+            loaded: true,
         }
     }
 
@@ -1393,6 +1434,8 @@ pub(crate) struct MouseKeysSettingsState {
     pub(crate) wheel_time_to_max: u16,
     /// Whether any of the qsids were readable (firmware support flag)
     pub(crate) supported: bool,
+    /// Mouse-key qsids whose values were read successfully or acknowledged.
+    pub(crate) loaded_qsids: QmkSettingValueSet,
 }
 
 /// Ergohaven K:03 Pro touchpad settings exposed by firmware QMK Settings.
@@ -1420,6 +1463,8 @@ pub(crate) struct TouchpadSettingsState {
     pub(crate) auto_layer_variants: Vec<String>,
     /// Whether qsid 120..124 were readable and advertised by firmware definition/query
     pub(crate) supported: bool,
+    /// Touchpad qsids whose values were read successfully or acknowledged.
+    pub(crate) loaded_qsids: QmkSettingValueSet,
 }
 
 impl TouchpadSettingsState {
@@ -1467,8 +1512,6 @@ pub(crate) struct BluetoothProfileColorSetting {
 /// RMK wireless settings exposed by the Bluetooth settings tab in Vial.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct BluetoothSettingsState {
-    /// Sleep timeout before the keyboard enters Bluetooth sleep mode
-    pub(crate) sleep_timeout: Option<BluetoothSelectSetting>,
     /// Whether the halves show yellow/green battery charging status on their LEDs
     pub(crate) charge_indicator: Option<BluetoothBooleanSetting>,
     /// Palette color index for each firmware-supported Bluetooth profile
@@ -1479,9 +1522,7 @@ pub(crate) struct BluetoothSettingsState {
 
 impl BluetoothSettingsState {
     pub(crate) fn row_count(&self) -> usize {
-        self.sleep_timeout.is_some() as usize
-            + self.charge_indicator.is_some() as usize
-            + self.profile_colors.len()
+        self.charge_indicator.is_some() as usize + self.profile_colors.len()
     }
 }
 
@@ -1626,20 +1667,10 @@ impl ModuleSettingsGroup {
 
     pub(crate) fn selected_module_kind(&self, value: u16) -> Option<ModuleDeviceKind> {
         let field = self.module_selector_field()?;
-        let selected = field
-            .variants
-            .get(value as usize)
-            .map(|variant| ModuleDeviceKind::from_variant(variant))?;
-        if selected != ModuleDeviceKind::None {
-            return Some(selected);
-        }
-
         field
             .variants
-            .iter()
+            .get(value as usize)
             .map(|variant| ModuleDeviceKind::from_variant(variant))
-            .find(|kind| *kind != ModuleDeviceKind::None)
-            .or(Some(selected))
     }
 
     pub(crate) fn selected_pointer_mode(&self, value: u16) -> Option<PointerModeKind> {
@@ -1883,6 +1914,8 @@ pub(crate) struct TapHoldSettingsState {
     pub(crate) flow_tap: u16,
     /// Bitset of tap-hold qsids advertised by this firmware.
     pub(crate) supported_qsids: u64,
+    /// Tap-hold qsids whose values were read successfully or acknowledged.
+    pub(crate) loaded_qsids: QmkSettingValueSet,
     /// Whether qsid 7 was readable (firmware support flag)
     pub(crate) supported: bool,
 }
@@ -1896,6 +1929,14 @@ impl TapHoldSettingsState {
 
     pub(crate) fn supports_qsid(&self, qsid: u16) -> bool {
         qsid < u64::BITS as u16 && self.supported_qsids & (1u64 << qsid) != 0
+    }
+
+    pub(crate) fn set_qsid_loaded(&mut self, qsid: u16) {
+        self.loaded_qsids.mark(qsid);
+    }
+
+    pub(crate) fn qsid_loaded(&self, qsid: u16) -> bool {
+        self.loaded_qsids.contains(qsid)
     }
 }
 
@@ -2502,7 +2543,7 @@ pub(crate) enum ComboPickField {
 pub(crate) enum SettingsTab {
     AppSettings,
     MatrixTester,
-    UniversalSymbolsSetup,
+    TextExpanderSetup,
     TextExpander,
     TypingTrainer,
     AutoShift,
@@ -3731,7 +3772,7 @@ impl Default for LayoutImageExportState {
 pub(crate) const LAYOUT_BASE_UNIT: f32 = 54.0_f32 * 1.15;
 pub(crate) const LAYOUT_KEY_PADDING: f32 = 2.5_f32;
 pub(crate) const LAYOUT_FIT_MARGIN: f32 = 40.0_f32;
-pub(crate) const LAYOUT_ENCODER_RADIUS_FACTOR: f32 = 0.47_f32;
+pub(crate) const LAYOUT_ENCODER_RADIUS_FACTOR: f32 = 0.47_f32 * 1.10_f32;
 pub(crate) const LAYOUT_ENCODER_FILL_EXTRA: f32 = 1.0_f32;
 pub(crate) const LAYOUT_TOP_RESERVED_H: f32 = 32.0_f32 + 4.0_f32 + 68.0_f32;
 pub(crate) const LAYOUT_BOTTOM_RESERVED_H: f32 = 76.0_f32;

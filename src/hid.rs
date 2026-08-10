@@ -14,7 +14,7 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{mpsc, Mutex};
 
 #[path = "hid_protocol.rs"]
-mod hid_protocol;
+pub(crate) mod hid_protocol;
 use hid_protocol::*;
 
 /// hidapi's macOS backend uses a process-global IOHIDManager. Concurrent
@@ -102,6 +102,8 @@ const WINDOWS_BLE_READ_SLICE_MS: i32 = 250;
 const WINDOWS_BLE_SETTLE_DELAY: Duration = Duration::from_millis(12);
 #[cfg(target_os = "linux")]
 const LINUX_BLE_NOTIFICATION_PROBE_TIMEOUT_MS: i32 = 80;
+#[cfg(target_os = "linux")]
+const LINUX_BLE_UNCORRELATED_REPLY_SETTLE: Duration = Duration::from_millis(32);
 #[cfg(target_os = "windows")]
 const WINDOWS_HID_HELPER_USB_COMMAND_TIMEOUT: Duration = Duration::from_millis(1_500);
 #[cfg(target_os = "windows")]
@@ -208,6 +210,7 @@ impl TestHidRecorder {
 #[derive(Clone, Copy)]
 pub(crate) enum TestHidFault {
     Disconnect,
+    Timeout,
     WorkerPanic,
 }
 
@@ -397,19 +400,33 @@ impl Drop for HidProxy {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub fn is_disconnect_error_message(message: &str) -> bool {
+pub fn is_transport_disconnect_error_message(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
     message.contains("disconnected")
-        || message.contains("device did not respond")
-        || message.contains("hid helper timed out")
-        || message.contains("failed to write hid helper request")
-        || message.contains("failed to flush hid helper request")
-        || message.contains("hid write failed")
-        || message.contains("hid read failed")
         || message.contains("broken pipe")
         || message.contains("pipe is being closed")
         || message.contains("the device is not connected")
         || message.contains("org.bluez.error.notconnected")
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn is_transport_disconnect_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| is_transport_disconnect_error_message(&cause.to_string()))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn is_disconnect_error_message(message: &str) -> bool {
+    is_transport_disconnect_error_message(message) || {
+        let message = message.to_ascii_lowercase();
+        message.contains("device did not respond")
+            || message.contains("hid helper timed out")
+            || message.contains("failed to write hid helper request")
+            || message.contains("failed to flush hid helper request")
+            || message.contains("hid write failed")
+            || message.contains("hid read failed")
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -809,12 +826,16 @@ impl HidDevice {
                 if let Some((_, fault)) = fault {
                     match fault {
                         TestHidFault::Disconnect => bail!("HID device disconnected"),
+                        TestHidFault::Timeout => bail!("HID timeout — device did not respond"),
                         TestHidFault::WorkerPanic => panic!("test HID worker stopped"),
                     }
                 }
 
                 let mut response = [0; MSG_LEN];
                 match (request[0], request[1], request[2]) {
+                    (CMD_VIA_MACRO_GET_BUFFER_SIZE, _, _) => {
+                        response[1..3].copy_from_slice(&64u16.to_be_bytes());
+                    }
                     (CMD_VIA_VIAL_PREFIX, CMD_VIAL_DYNAMIC_ENTRY_OP, DYNAMIC_VIAL_COMBO_SET) => {
                         let mut keys = [0; 4];
                         for (index, key) in keys.iter_mut().enumerate() {
@@ -943,6 +964,22 @@ fn write_output_report_local(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn is_optional_firmware_version_request(data: &[u8]) -> bool {
+    data.starts_with(&[CMD_VIA_GET_KEYBOARD_VALUE, VIA_FIRMWARE_VERSION])
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn usb_send_max_attempts(transport: HidTransport, data: &[u8]) -> usize {
+    // Runtime firmware metadata has a Vial-definition fallback, so an
+    // unsupported probe must not hold up the whole connection retry budget.
+    if transport.is_bluetooth() || is_optional_firmware_version_request(data) {
+        1
+    } else {
+        VIAL_GUI_USB_RETRIES
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn usb_send_local(
     device: &hidapi::HidDevice,
     transport: HidTransport,
@@ -971,11 +1008,7 @@ fn usb_send_local(
         VIAL_GUI_READ_TIMEOUT_MS
     };
 
-    let max_retries = if transport.is_bluetooth() {
-        1
-    } else {
-        VIAL_GUI_USB_RETRIES
-    };
+    let max_retries = usb_send_max_attempts(transport, data);
 
     let mut last_error: Option<anyhow::Error> = None;
     for attempt in 0..max_retries {
@@ -1411,9 +1444,11 @@ fn read_response_via_input_report(
 ) -> Result<[u8; MSG_LEN]> {
     let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms.max(1) as u64);
 
-    // Give RMK one BLE connection interval to process the output report before
-    // reading the input characteristic through BlueZ's UHID GET_REPORT path.
-    std::thread::sleep(WINDOWS_BLE_SETTLE_DELAY);
+    // QMK_SETTINGS_GET and GET_ENCODER replies do not identify their request.
+    // A single interval can therefore return the preceding value and shift a
+    // sequence of settings (for example left module -> right module). Give
+    // those commands the same four-interval freshness window as direct GATT.
+    std::thread::sleep(linux_ble_input_report_settle(command));
 
     loop {
         let mut read_buf = [0u8; MSG_LEN + 1];
@@ -1439,6 +1474,15 @@ fn read_response_via_input_report(
     }
 }
 
+#[cfg(target_os = "linux")]
+fn linux_ble_input_report_settle(command: &[u8]) -> Duration {
+    if vial_reply_is_uncorrelated(command) {
+        LINUX_BLE_UNCORRELATED_REPLY_SETTLE
+    } else {
+        WINDOWS_BLE_SETTLE_DELAY
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn response_matches_command(command: &[u8], resp: &[u8; MSG_LEN]) -> bool {
     let Some(&cmd) = command.first() else {
@@ -1458,11 +1502,18 @@ fn response_matches_command(command: &[u8], resp: &[u8; MSG_LEN]) -> bool {
         }
         CMD_VIA_MACRO_GET_COUNT | CMD_VIA_MACRO_GET_BUFFER_SIZE => resp[0] == cmd,
         CMD_VIA_CUSTOM_GET_VALUE if command.get(1) == Some(&ERGOHAVEN_CUSTOM_NAMESPACE) => {
-            command.len() >= 3 && resp[0] == cmd && resp[1..3] == command[1..3]
+            crate::rmk_native::matches_rmk_native_get_response(command, resp).unwrap_or_else(|| {
+                command.len() >= 3 && resp[0] == cmd && resp[1..3] == command[1..3]
+            })
         }
-        CMD_VIA_GET_KEYBOARD_VALUE | CMD_VIA_LIGHTING_GET_VALUE => {
-            command.len() >= 2 && resp[0] == cmd && resp[1] == command[1]
+        CMD_VIA_GET_KEYBOARD_VALUE => {
+            command.len() >= 2
+                && ((resp[0] == cmd && resp[1] == command[1])
+                    || (is_optional_firmware_version_request(command)
+                        && resp[0] == u8::MAX
+                        && resp[1] == VIA_FIRMWARE_VERSION))
         }
+        CMD_VIA_LIGHTING_GET_VALUE => command.len() >= 2 && resp[0] == cmd && resp[1] == command[1],
         CMD_VIA_GET_KEYCODE => command.len() >= 4 && resp[0] == cmd && resp[1..4] == command[1..4],
         CMD_VIA_SET_KEYBOARD_VALUE
         | CMD_VIA_SET_KEYCODE
@@ -1531,7 +1582,26 @@ fn response_matches_qmk_settings_set(command: &[u8], resp: &[u8; MSG_LEN]) -> bo
 
 #[cfg(not(target_arch = "wasm32"))]
 fn response_matches_qmk_settings_get(command: &[u8], resp: &[u8; MSG_LEN]) -> bool {
-    command.len() >= 4 && (resp[0] == 0 || response_echoes_vial_command(command, resp))
+    let Some(qsid_bytes) = command.get(2..4) else {
+        return false;
+    };
+    if response_echoes_vial_command(command, resp) {
+        return true;
+    }
+    if resp[0] != 0 {
+        return false;
+    }
+
+    let qsid = u16::from_le_bytes([qsid_bytes[0], qsid_bytes[1]]);
+    if !(200..232).contains(&qsid) {
+        return true;
+    }
+
+    let payload = &resp[1..];
+    let Some(end) = payload.iter().position(|byte| *byte == 0) else {
+        return false;
+    };
+    end <= 15 && std::str::from_utf8(&payload[..end]).is_ok()
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -2035,6 +2105,78 @@ mod tests {
         .is_err());
     }
 
+    #[test]
+    fn optional_firmware_version_probe_uses_one_usb_attempt() {
+        let command = [CMD_VIA_GET_KEYBOARD_VALUE, VIA_FIRMWARE_VERSION];
+
+        assert_eq!(usb_send_max_attempts(HidTransport::Usb, &command), 1);
+    }
+
+    #[test]
+    fn mandatory_usb_request_keeps_full_retry_budget() {
+        let command = [CMD_VIA_GET_PROTOCOL_VERSION];
+
+        assert_eq!(
+            usb_send_max_attempts(HidTransport::Usb, &command),
+            VIAL_GUI_USB_RETRIES
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn uncorrelated_linux_ble_gets_wait_for_a_fresh_input_report() {
+        let mut command = [0u8; MSG_LEN];
+        command[0] = CMD_VIA_VIAL_PREFIX;
+        command[1] = CMD_VIAL_QMK_SETTINGS_GET;
+
+        assert_eq!(
+            linux_ble_input_report_settle(&command),
+            LINUX_BLE_UNCORRELATED_REPLY_SETTLE
+        );
+
+        command[1] = CMD_VIAL_GET_DEFINITION;
+        assert_eq!(
+            linux_ble_input_report_settle(&command),
+            WINDOWS_BLE_SETTLE_DELAY
+        );
+    }
+
+    #[test]
+    fn firmware_version_probe_accepts_successful_response() {
+        let command = [CMD_VIA_GET_KEYBOARD_VALUE, VIA_FIRMWARE_VERSION];
+        let mut response = [0u8; MSG_LEN];
+        response[..6].copy_from_slice(&[
+            CMD_VIA_GET_KEYBOARD_VALUE,
+            VIA_FIRMWARE_VERSION,
+            0,
+            4,
+            0,
+            5,
+        ]);
+
+        assert!(response_matches_command(&command, &response));
+    }
+
+    #[test]
+    fn firmware_version_probe_accepts_matching_unhandled_response() {
+        let command = [CMD_VIA_GET_KEYBOARD_VALUE, VIA_FIRMWARE_VERSION];
+        let mut response = [0u8; MSG_LEN];
+        response[0] = u8::MAX;
+        response[1] = VIA_FIRMWARE_VERSION;
+
+        assert!(response_matches_command(&command, &response));
+    }
+
+    #[test]
+    fn firmware_version_probe_rejects_unhandled_response_for_another_value() {
+        let command = [CMD_VIA_GET_KEYBOARD_VALUE, VIA_FIRMWARE_VERSION];
+        let mut response = [0u8; MSG_LEN];
+        response[0] = u8::MAX;
+        response[1] = VIA_SWITCH_MATRIX_STATE;
+
+        assert!(!response_matches_command(&command, &response));
+    }
+
     fn qmk_settings_command(subcommand: u8, qsid: u16) -> [u8; MSG_LEN] {
         let mut command = [0u8; MSG_LEN];
         command[0] = CMD_VIA_VIAL_PREFIX;
@@ -2110,6 +2252,19 @@ mod tests {
     }
 
     #[test]
+    fn layer_name_get_rejects_stale_encoder_payload() {
+        let command = qmk_settings_command(CMD_VIAL_QMK_SETTINGS_GET, 201);
+        let mut stale_encoder = [0u8; MSG_LEN];
+        stale_encoder[..4].copy_from_slice(&[0x00, 0xEA, 0x00, 0xE9]);
+
+        assert!(!response_matches_command(&command, &stale_encoder));
+
+        let mut valid_name = [0u8; MSG_LEN];
+        valid_name[1..5].copy_from_slice(b"Nav\0");
+        assert!(response_matches_command(&command, &valid_name));
+    }
+
+    #[test]
     fn qmk_settings_query_accepts_advancing_qsids_and_terminator() {
         let command = qmk_settings_command(CMD_VIAL_QMK_SETTINGS_QUERY, 100);
         let mut response = [u8::MAX; MSG_LEN];
@@ -2137,5 +2292,31 @@ mod tests {
         response[4..6].copy_from_slice(&300u16.to_le_bytes());
 
         assert!(!response_matches_command(&command, &response));
+    }
+
+    #[test]
+    fn native_action_scan_rejects_a_stale_flat_index() {
+        let mut command = [0u8; MSG_LEN];
+        command[0] = CMD_VIA_CUSTOM_GET_VALUE;
+        command[1] = ERGOHAVEN_CUSTOM_NAMESPACE;
+        command[2] = 0x04;
+        command[3] = 0x01;
+        command[4..6].copy_from_slice(&59u16.to_le_bytes());
+
+        let mut stale_response = command;
+        stale_response[4] = 0;
+        stale_response[5..7].copy_from_slice(&58u16.to_le_bytes());
+
+        assert!(!response_matches_command(&command, &stale_response));
+    }
+
+    #[test]
+    fn native_capabilities_accepts_exact_qmk_echo_as_unsupported() {
+        let mut command = [0u8; MSG_LEN];
+        command[0] = CMD_VIA_CUSTOM_GET_VALUE;
+        command[1] = ERGOHAVEN_CUSTOM_NAMESPACE;
+        command[2] = 0x02;
+
+        assert!(response_matches_command(&command, &command));
     }
 }

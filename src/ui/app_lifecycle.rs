@@ -548,7 +548,7 @@ mod tests {
         assert!(app.settings_write_task.is_some());
 
         app.keycode_picker.macro_texts = vec![vec![1, 2, 3]];
-        app.keycode_picker.macros_dirty = true;
+        app.keycode_picker.mark_macros_dirty();
         app.combo_entries = vec![combo([0x0004, 0x0005, 0, 0], 0x0006)];
         app.combo_synced_entries = vec![ComboEntry::default()];
         app.combo_dirty = true;
@@ -938,7 +938,7 @@ mod tests {
         app.combo_edit_revision = 1;
         app.maybe_start_combo_write(&ctx);
         app.queue_touchpad_setting_write("Sniper sensitivity".to_owned(), 121, 1, 1, 2);
-        app.keycode_picker.macros_dirty = true;
+        app.keycode_picker.mark_macros_dirty();
         app.exit_after_hid_write = true;
 
         let mut close_count = 0;
@@ -1665,66 +1665,16 @@ impl eframe::App for EntropyApp {
             .as_ref()
             .map(|hid| hid.is_bluetooth_transport())
             .unwrap_or(false);
+
+        self.flush_pending_key_override_writes();
+
+        #[cfg(not(target_arch = "wasm32"))]
+        self.maybe_start_macro_write(ctx);
+
         #[cfg(not(target_arch = "wasm32"))]
         let hid_write_task_active = self.hid_write_task_active();
         #[cfg(target_arch = "wasm32")]
         let hid_write_task_active = false;
-
-        self.flush_pending_key_override_writes();
-
-        if self.keycode_picker.macros_dirty && !self.keycode_picker.open && !hid_write_task_active {
-            if self.unlock_open || self.vial_unlock_polling {
-                // Defer macro write until unlock flow fully finishes.
-            } else if self.is_vial_locked() {
-                self.unlock_open = true;
-                self.status_msg = crate::i18n::tr_catalog(
-                    self.app_settings.language,
-                    "connection.keyboard_locked_edit_macros",
-                )
-                .into();
-            } else {
-                if let Some(hid) = &self.hid_device {
-                    match hid.get_macro_buffer_size() {
-                        Ok(size) => {
-                            let buf = crate::hid::HidDevice::encode_macros(
-                                &self.keycode_picker.macro_texts,
-                                size,
-                            );
-                            match hid.set_macro_buffer(&buf) {
-                                Ok(()) => {
-                                    self.keycode_picker.macros_dirty = false;
-                                    self.status_msg = crate::i18n::tr_catalog(
-                                        self.app_settings.language,
-                                        "status_messages.macros_saved",
-                                    )
-                                    .into()
-                                }
-                                Err(e) => {
-                                    self.status_msg = crate::i18n::tr_catalog_format(
-                                        self.app_settings.language,
-                                        "status_messages.macro_write_error",
-                                        &[("error", &e.to_string())],
-                                    )
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            self.status_msg = crate::i18n::tr_catalog_format(
-                                self.app_settings.language,
-                                "status_messages.macro_write_error",
-                                &[("error", &e.to_string())],
-                            )
-                        }
-                    }
-                } else {
-                    self.status_msg = crate::i18n::tr_catalog_format(
-                        self.app_settings.language,
-                        "status_messages.macro_write_error",
-                        &[("error", "device handle is not available")],
-                    )
-                }
-            }
-        }
 
         if self.combo_term_dirty
             && !self.keycode_picker.open

@@ -10,6 +10,8 @@ const ERGOHAVEN_CUSTOM_NATIVE_KEY_ACTION: u8 = 0x03;
 const ERGOHAVEN_CUSTOM_NEXT_NATIVE_KEY_ACTION: u8 = 0x04;
 const ERGOHAVEN_NATIVE_KEY_ACTION_VERSION: u8 = 0x01;
 const ERGOHAVEN_NATIVE_KEY_ACTION_CAP_GET_SET: u16 = 0x0001;
+const ERGOHAVEN_NATIVE_KEY_ACTION_CAP_UNIVERSAL_SYMBOLS: u16 = 0x0002;
+const ERGOHAVEN_NATIVE_KEY_ACTION_CAP_RUSSIAN_LETTERS: u16 = 0x0004;
 const NATIVE_KEY_ACTION_STATUS_OK: u8 = 0x00;
 const NATIVE_KEY_ACTION_STATUS_END: u8 = 0x01;
 const NATIVE_KEY_ACTION_STATUS_UNSUPPORTED_VERSION: u8 = 0x02;
@@ -23,6 +25,8 @@ const NATIVE_KEY_ACTION_MAX_PAYLOAD: usize = MSG_LEN - NATIVE_KEY_ACTION_SET_PAY
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RmkNativeCapabilities {
     pub(crate) key_actions: bool,
+    pub(crate) universal_symbols: bool,
+    pub(crate) russian_letters: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -141,6 +145,71 @@ fn native_response_header_matches(response: &[u8; MSG_LEN], subcommand: u8) -> b
         && response[2] == subcommand
 }
 
+pub(crate) fn matches_rmk_native_get_response(
+    command: &[u8],
+    response: &[u8; MSG_LEN],
+) -> Option<bool> {
+    if command.first() != Some(&CMD_VIA_CUSTOM_GET_VALUE)
+        || command.get(1) != Some(&ERGOHAVEN_CUSTOM_NAMESPACE)
+    {
+        return None;
+    }
+    let subcommand = *command.get(2)?;
+    if !matches!(
+        subcommand,
+        ERGOHAVEN_CUSTOM_NATIVE_KEY_ACTION_CAPS
+            | ERGOHAVEN_CUSTOM_NATIVE_KEY_ACTION
+            | ERGOHAVEN_CUSTOM_NEXT_NATIVE_KEY_ACTION
+    ) {
+        return None;
+    }
+
+    // Standard QMK-Vial echoes unknown custom GET commands unchanged. Treat an
+    // exact capabilities probe echo as a terminal "RMK unsupported" response;
+    // the decoder below will return empty capabilities without transport retries.
+    if subcommand == ERGOHAVEN_CUSTOM_NATIVE_KEY_ACTION_CAPS
+        && command.len() == response.len()
+        && command == response
+    {
+        return Some(true);
+    }
+
+    let header_matches = response[0] == CMD_VIA_CUSTOM_GET_VALUE
+        && response[1] == ERGOHAVEN_CUSTOM_NAMESPACE
+        && response[2] == subcommand
+        && response[3] == ERGOHAVEN_NATIVE_KEY_ACTION_VERSION;
+    if !header_matches || subcommand != ERGOHAVEN_CUSTOM_NEXT_NATIVE_KEY_ACTION {
+        return Some(header_matches);
+    }
+
+    if response[4] != NATIVE_KEY_ACTION_STATUS_OK {
+        return Some(true);
+    }
+    let requested_cursor = command
+        .get(4..6)
+        .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))?;
+    let returned_index = u16::from_le_bytes([response[5], response[6]]);
+    Some(returned_index >= requested_cursor)
+}
+
+fn decode_native_capabilities(response: &[u8; MSG_LEN]) -> RmkNativeCapabilities {
+    if !native_response_header_matches(response, ERGOHAVEN_CUSTOM_NATIVE_KEY_ACTION_CAPS)
+        || response[3] != ERGOHAVEN_NATIVE_KEY_ACTION_VERSION
+    {
+        return RmkNativeCapabilities::default();
+    }
+    let flags = u16::from_le_bytes([response[4], response[5]]);
+    RmkNativeCapabilities {
+        key_actions: flags & ERGOHAVEN_NATIVE_KEY_ACTION_CAP_GET_SET != 0,
+        universal_symbols: flags & ERGOHAVEN_NATIVE_KEY_ACTION_CAP_UNIVERSAL_SYMBOLS != 0,
+        russian_letters: flags & ERGOHAVEN_NATIVE_KEY_ACTION_CAP_RUSSIAN_LETTERS != 0,
+    }
+}
+
+pub(crate) const fn supports_layout_sync(capabilities: RmkNativeCapabilities) -> bool {
+    capabilities.universal_symbols
+}
+
 fn decode_native_action(
     response: &[u8; MSG_LEN],
     status_offset: usize,
@@ -170,15 +239,7 @@ impl crate::hid::HidDevice {
         command[1] = ERGOHAVEN_CUSTOM_NAMESPACE;
         command[2] = ERGOHAVEN_CUSTOM_NATIVE_KEY_ACTION_CAPS;
         let response = self.usb_send(&command)?;
-        if !native_response_header_matches(&response, ERGOHAVEN_CUSTOM_NATIVE_KEY_ACTION_CAPS)
-            || response[3] != ERGOHAVEN_NATIVE_KEY_ACTION_VERSION
-        {
-            return Ok(RmkNativeCapabilities::default());
-        }
-        let flags = u16::from_le_bytes([response[4], response[5]]);
-        Ok(RmkNativeCapabilities {
-            key_actions: flags & ERGOHAVEN_NATIVE_KEY_ACTION_CAP_GET_SET != 0,
-        })
+        Ok(decode_native_capabilities(&response))
     }
 
     pub(crate) fn get_rmk_key_action(&self, layer: u8, row: u8, col: u8) -> Result<KeyAction> {
@@ -312,6 +373,96 @@ mod tests {
     use rmk_types::action::Action;
     use rmk_types::keycode::HidKeyCode;
     use rmk_types::modifier::ModifierCombination;
+
+    #[test]
+    fn decodes_universal_symbols_capability_independently() {
+        let mut response = [0u8; MSG_LEN];
+        response[0] = CMD_VIA_CUSTOM_GET_VALUE;
+        response[1] = ERGOHAVEN_CUSTOM_NAMESPACE;
+        response[2] = ERGOHAVEN_CUSTOM_NATIVE_KEY_ACTION_CAPS;
+        response[3] = ERGOHAVEN_NATIVE_KEY_ACTION_VERSION;
+        response[4..6].copy_from_slice(
+            &(ERGOHAVEN_NATIVE_KEY_ACTION_CAP_GET_SET
+                | ERGOHAVEN_NATIVE_KEY_ACTION_CAP_UNIVERSAL_SYMBOLS
+                | ERGOHAVEN_NATIVE_KEY_ACTION_CAP_RUSSIAN_LETTERS)
+                .to_le_bytes(),
+        );
+
+        assert_eq!(
+            decode_native_capabilities(&response),
+            RmkNativeCapabilities {
+                key_actions: true,
+                universal_symbols: true,
+                russian_letters: true,
+            }
+        );
+        response[4..6].copy_from_slice(
+            &(ERGOHAVEN_NATIVE_KEY_ACTION_CAP_GET_SET
+                | ERGOHAVEN_NATIVE_KEY_ACTION_CAP_UNIVERSAL_SYMBOLS)
+                .to_le_bytes(),
+        );
+        assert!(!decode_native_capabilities(&response).russian_letters);
+        response[3] = ERGOHAVEN_NATIVE_KEY_ACTION_VERSION + 1;
+        assert_eq!(
+            decode_native_capabilities(&response),
+            RmkNativeCapabilities::default()
+        );
+    }
+
+    #[test]
+    fn universal_symbols_capability_enables_existing_layout_sync_bridge() {
+        assert!(supports_layout_sync(RmkNativeCapabilities {
+            key_actions: true,
+            universal_symbols: true,
+            russian_letters: false,
+        }));
+        assert!(!supports_layout_sync(RmkNativeCapabilities {
+            key_actions: true,
+            universal_symbols: false,
+            russian_letters: false,
+        }));
+    }
+
+    #[test]
+    fn native_action_scan_response_must_reach_the_requested_cursor() {
+        let mut command = [0u8; MSG_LEN];
+        command[0] = CMD_VIA_CUSTOM_GET_VALUE;
+        command[1] = ERGOHAVEN_CUSTOM_NAMESPACE;
+        command[2] = ERGOHAVEN_CUSTOM_NEXT_NATIVE_KEY_ACTION;
+        command[3] = ERGOHAVEN_NATIVE_KEY_ACTION_VERSION;
+        command[4..6].copy_from_slice(&59u16.to_le_bytes());
+
+        let mut response = command;
+        response[4] = NATIVE_KEY_ACTION_STATUS_OK;
+        response[5..7].copy_from_slice(&58u16.to_le_bytes());
+        assert_eq!(
+            matches_rmk_native_get_response(&command, &response),
+            Some(false)
+        );
+
+        response[5..7].copy_from_slice(&59u16.to_le_bytes());
+        assert_eq!(
+            matches_rmk_native_get_response(&command, &response),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn native_capability_probe_accepts_exact_qmk_echo() {
+        let mut command = [0u8; MSG_LEN];
+        command[0] = CMD_VIA_CUSTOM_GET_VALUE;
+        command[1] = ERGOHAVEN_CUSTOM_NAMESPACE;
+        command[2] = ERGOHAVEN_CUSTOM_NATIVE_KEY_ACTION_CAPS;
+
+        assert_eq!(
+            matches_rmk_native_get_response(&command, &command),
+            Some(true)
+        );
+        assert_eq!(
+            decode_native_capabilities(&command),
+            RmkNativeCapabilities::default()
+        );
+    }
 
     #[test]
     fn decodes_native_mod_tap_payload() {

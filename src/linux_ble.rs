@@ -1,5 +1,10 @@
 use crate::device::Device;
 use crate::firmware::FirmwareProtocol;
+use crate::hid::hid_protocol::vial_reply_is_uncorrelated;
+#[cfg(test)]
+use crate::hid::hid_protocol::{
+    CMD_VIAL_GET_ENCODER, CMD_VIAL_QMK_SETTINGS_GET, CMD_VIA_VIAL_PREFIX,
+};
 use anyhow::{bail, Context, Result};
 use futures_lite::{future, StreamExt};
 use std::collections::HashMap;
@@ -36,6 +41,19 @@ const BLUEZ_REPLY_TIMEOUT: Duration = Duration::from_millis(2_500);
 // and keymap request. One connection interval is enough; a response that is
 // not ready yet is rejected by `response_matches` and retried safely.
 const BLUEZ_REPLY_POLL_INTERVAL: Duration = Duration::from_millis(8);
+// GET_ENCODER and QMK_SETTINGS_GET do not echo an identifier in successful
+// replies. BlueZ may therefore surface the previous characteristic value or a
+// late notification before RMK has processed the new request. Give every reply
+// path four 7.5 ms connection intervals to become fresh.
+const BLUEZ_UNCORRELATED_REPLY_SETTLE: Duration = Duration::from_millis(32);
+
+fn reply_settle_for_command(data: &[u8]) -> Duration {
+    if vial_reply_is_uncorrelated(data) {
+        BLUEZ_UNCORRELATED_REPLY_SETTLE
+    } else {
+        Duration::ZERO
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CharacteristicSummary {
@@ -390,7 +408,7 @@ fn select_hid_vial_endpoints(
                 })
                 .and_then(|descriptor| {
                     (descriptor.value.len() >= 2)
-                        .then_some((descriptor.value[0], descriptor.value[1]))
+                        .then(|| (descriptor.value[0], descriptor.value[1]))
                 })
         };
 
@@ -868,14 +886,16 @@ impl LinuxBleDevice {
         while notifications.try_recv().is_ok() {}
 
         self.write_value_with_type(data, write_type)?;
+        let reply_not_before = Instant::now() + reply_settle_for_command(data);
 
-        self.wait_for_reply(data, notifications, response_matches)
+        self.wait_for_reply(data, notifications, reply_not_before, response_matches)
     }
 
     fn wait_for_reply(
         &self,
         data: &[u8],
         notifications: &mpsc::Receiver<Vec<u8>>,
+        reply_not_before: Instant,
         response_matches: &impl Fn(&[u8; 32]) -> bool,
     ) -> Result<[u8; 32]> {
         let deadline = Instant::now() + BLUEZ_REPLY_TIMEOUT;
@@ -895,11 +915,11 @@ impl LinuxBleDevice {
                         ));
                         continue;
                     };
-                    if response_matches(&response) {
+                    if response_matches(&response) && Instant::now() >= reply_not_before {
                         return Ok(response);
                     }
                     last_unrelated = Some(format!(
-                        "stale Bluetooth Vial notification {:02X?}",
+                        "stale or early Bluetooth Vial notification {:02X?}",
                         &response[..data.len().clamp(3, 8)]
                     ));
                 }
@@ -907,6 +927,10 @@ impl LinuxBleDevice {
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     bail!("Bluetooth GATT disconnected while waiting for a Vial reply")
                 }
+            }
+
+            if Instant::now() < reply_not_before {
+                continue;
             }
 
             let read_options = HashMap::<&str, Value<'_>>::new();
@@ -965,7 +989,8 @@ impl LinuxBleDevice {
             writer
                 .write_output_report(data)
                 .context("Failed to write the Bluetooth Vial request through Linux HID")?;
-            return self.wait_for_reply(data, &notifications, &response_matches);
+            let reply_not_before = Instant::now() + reply_settle_for_command(data);
+            return self.wait_for_reply(data, &notifications, reply_not_before, &response_matches);
         }
 
         let preferred = self
@@ -1182,7 +1207,7 @@ mod tests {
     }
 
     #[test]
-    fn selects_vial_report_from_current_single_hid_service() {
+    fn selects_vial_report_when_another_report_has_an_empty_reference() {
         let services = HashMap::from([("/service/combined".to_owned(), "/device".to_owned())]);
         let vial_report_map = vec![
             0x06, 0x60, 0xFF, // Usage Page 0xFF60
@@ -1204,6 +1229,12 @@ mod tests {
         report_map.value = vial_report_map;
         let characteristics = vec![
             report_map,
+            characteristic(
+                "/service/combined/malformed_report",
+                "/service/combined",
+                REPORT_CHARACTERISTIC_UUID,
+                &["read", "notify"],
+            ),
             characteristic(
                 "/service/combined/keyboard_input",
                 "/service/combined",
@@ -1229,7 +1260,15 @@ mod tests {
                 &["read", "write", "write-without-response"],
             ),
         ];
+        let mut empty_reference = descriptor(
+            "/service/combined/malformed_report/reference",
+            "/service/combined/malformed_report",
+            0,
+            0,
+        );
+        empty_reference.value.clear();
         let descriptors = vec![
+            empty_reference,
             descriptor(
                 "/service/combined/keyboard_input/reference",
                 "/service/combined/keyboard_input",
@@ -1299,5 +1338,25 @@ mod tests {
         prefixed[1..].copy_from_slice(&response);
         assert_eq!(normalize_notification(&prefixed), Some(response));
         assert_eq!(normalize_notification(&[0u8; 31]), None);
+    }
+
+    #[test]
+    fn delays_replies_only_for_uncorrelated_vial_gets() {
+        let mut command = [0u8; 32];
+        command[0] = CMD_VIA_VIAL_PREFIX;
+        command[1] = CMD_VIAL_GET_ENCODER;
+        assert_eq!(
+            reply_settle_for_command(&command),
+            BLUEZ_UNCORRELATED_REPLY_SETTLE
+        );
+
+        command[1] = CMD_VIAL_QMK_SETTINGS_GET;
+        assert_eq!(
+            reply_settle_for_command(&command),
+            BLUEZ_UNCORRELATED_REPLY_SETTLE
+        );
+
+        command[1] = 0x00;
+        assert_eq!(reply_settle_for_command(&command), Duration::ZERO);
     }
 }
