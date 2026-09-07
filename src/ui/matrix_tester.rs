@@ -10,7 +10,7 @@ impl EntropyApp {
             .unwrap_or(false)
     }
 
-    fn matrix_tester_poll_interval(&self) -> std::time::Duration {
+    pub(super) fn matrix_tester_poll_interval(&self) -> std::time::Duration {
         matrix_tester_poll_interval_for_target(
             self.matrix_tester_uses_bluetooth_transport(),
             cfg!(target_os = "macos"),
@@ -87,48 +87,12 @@ impl EntropyApp {
         let now = std::time::Instant::now();
         let poll_interval = self.matrix_tester_poll_interval();
 
-        if matrix_tester_poll_mode_for_transport(self.matrix_tester_uses_bluetooth_transport())
-            == MatrixTesterPollMode::Background
-        {
-            if now.duration_since(self.matrix_tester_last_poll) >= poll_interval {
-                match self.start_vial_matrix_poll(ctx, rows, cols, remember_ever_pressed) {
-                    VialHidTaskStart::Started => {
-                        self.matrix_tester_last_poll = now;
-                    }
-                    VialHidTaskStart::Busy | VialHidTaskStart::NoDevice => {}
-                }
-            }
-            ctx.request_repaint_after(poll_interval);
-            return;
-        }
-
-        let Some(hid) = &self.hid_device else {
-            return;
-        };
-
         if now.duration_since(self.matrix_tester_last_poll) >= poll_interval {
-            self.matrix_tester_last_poll = now;
-            let poll_result = hid.get_switch_matrix_with_rmk_byte_order(
-                rows,
-                cols,
-                self.matrix_tester_rmk_byte_order,
-            );
-            match poll_result {
-                Ok(pressed) => {
-                    self.finish_matrix_tester_poll(pressed, remember_ever_pressed);
+            match self.start_vial_matrix_poll(ctx, rows, cols, remember_ever_pressed) {
+                VialHidTaskStart::Started => {
+                    self.matrix_tester_last_poll = now;
                 }
-                Err(e) => {
-                    log::warn!("Matrix poll error: {e}");
-                    if crate::hid::is_disconnect_error(&e) {
-                        if !self.begin_bluetooth_reconnect(e.to_string()) {
-                            self.clear_connected_keyboard_state("Device disconnected");
-                        }
-                        return;
-                    }
-                    self.matrix_tester_lock_checked = false;
-                    self.matrix_tester_last_lock_check =
-                        std::time::Instant::now() - MATRIX_TESTER_LOCK_CHECK_INTERVAL;
-                }
+                VialHidTaskStart::Busy | VialHidTaskStart::NoDevice => {}
             }
         }
         ctx.request_repaint_after(poll_interval);
@@ -198,18 +162,33 @@ impl EntropyApp {
             self.prompt_if_vial_locked_for_matrix_poll();
         }
 
-        let total_keys = layout.keys.len();
-        let tested_count = layout
-            .keys
-            .iter()
-            .filter(|key| {
-                let idx = key.row as usize * layout.cols + key.col as usize;
-                self.matrix_tester_ever_pressed
-                    .get(idx)
-                    .copied()
-                    .unwrap_or(false)
-            })
-            .count();
+        // Only the caps of the currently selected physical configuration exist
+        // on the board: alternative layout-option variants share matrix
+        // positions and must not be drawn or counted on top of each other, and
+        // layout_key_visible() also hides a module-owned encoder press key when
+        // its module is set to something other than an encoder.
+        let mut total_keys = 0;
+        let mut tested_count = 0;
+        for key in &layout.keys {
+            if !Self::layout_key_visible(
+                &self.module_settings,
+                layout,
+                key,
+                self.layout_options_value,
+            ) {
+                continue;
+            }
+            total_keys += 1;
+            let idx = key.row as usize * layout.cols + key.col as usize;
+            if self
+                .matrix_tester_ever_pressed
+                .get(idx)
+                .copied()
+                .unwrap_or(false)
+            {
+                tested_count += 1;
+            }
+        }
 
         crate::ui_style::allocate_ui_at_rect(
             ui,
@@ -333,18 +312,29 @@ impl EntropyApp {
             return;
         }
 
-        let viewport = egui::Rect::from_min_max(
-            ui.min_rect().min,
-            egui::pos2(
-                ui.min_rect().left() + ui.available_size().x,
-                ui.max_rect().bottom(),
-            ),
-        );
-        let geometry = layout_geometry(
+        // The header, the status button and the bottom hint are laid out from
+        // `content_rect`, which already sits below the top chrome. Fit the board
+        // into the rectangle left between them instead of the whole panel, so the
+        // caps never cover the header or the "Tested" button.
+        let key_visible = |key: &crate::keyboard::PhysicalKey| {
+            Self::layout_key_visible(
+                &self.module_settings,
+                layout,
+                key,
+                self.layout_options_value,
+            )
+        };
+        let geometry = layout_geometry_with_reserved_and_filter(
             ui.ctx(),
             layout,
-            viewport,
+            board_rect,
             clamp_ui_scale(self.app_settings.ui_scale),
+            0.0,
+            0.0,
+            LAYOUT_FIT_MARGIN,
+            None,
+            key_visible,
+            |_| false,
         );
 
         let hint_color = if dark {
@@ -364,6 +354,9 @@ impl EntropyApp {
         );
 
         for key in &layout.keys {
+            if !key_visible(key) {
+                continue;
+            }
             let matrix_idx = key.row as usize * layout.cols + key.col as usize;
             let is_pressed = self
                 .matrix_tester_pressed
@@ -414,22 +407,6 @@ fn matrix_tester_poll_interval_for_target(
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum MatrixTesterPollMode {
-    Inline,
-    Background,
-}
-
-fn matrix_tester_poll_mode_for_transport(bluetooth: bool) -> MatrixTesterPollMode {
-    // BLE Vial round-trips can block on every desktop OS. Keep them on the
-    // serialized background HID worker so live tools remain responsive.
-    if bluetooth {
-        MatrixTesterPollMode::Background
-    } else {
-        MatrixTesterPollMode::Inline
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -459,22 +436,6 @@ mod tests {
         assert_eq!(
             matrix_tester_poll_interval_for_target(false, true),
             std::time::Duration::from_millis(16)
-        );
-    }
-
-    #[test]
-    fn bluetooth_matrix_polling_uses_the_background_hid_worker_on_every_desktop() {
-        assert_eq!(
-            matrix_tester_poll_mode_for_transport(true),
-            MatrixTesterPollMode::Background
-        );
-    }
-
-    #[test]
-    fn usb_matrix_polling_stays_inline() {
-        assert_eq!(
-            matrix_tester_poll_mode_for_transport(false),
-            MatrixTesterPollMode::Inline
         );
     }
 }

@@ -235,6 +235,7 @@ impl EntropyApp {
         self.combo_dirty = false;
         self.combo_edit_revision = self.combo_edit_revision.wrapping_add(1);
         self.combo_attempted_revision = None;
+        self.supports_rmk_combo_layers = false;
         self.mouse_keys_settings = MouseKeysSettingsState::default();
         self.touchpad_settings = TouchpadSettingsState::default();
         self.bluetooth_settings = BluetoothSettingsState::default();
@@ -248,7 +249,6 @@ impl EntropyApp {
         self.layer_led_settings = LayerLedSettingsState::default();
         self.rgb_settings = RgbSettingsState::default();
         self.layout_options_value = None;
-        self.matrix_tester_rmk_byte_order = false;
         self.sticky_layout_prev_pressed.clear();
         self.sticky_layout_pressed_key_layers.clear();
         self.sticky_layout_toggled_layers.clear();

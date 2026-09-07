@@ -27,7 +27,6 @@ pub(super) enum VialHidOperation {
     Matrix {
         rows: usize,
         cols: usize,
-        rmk_byte_order: bool,
         remember_ever_pressed: bool,
     },
     BatteryRefresh,
@@ -125,13 +124,8 @@ fn run_vial_hid_operation(
             hid.lock()?;
             Ok(VialHidOutcome::Locked)
         }
-        VialHidOperation::Matrix {
-            rows,
-            cols,
-            rmk_byte_order,
-            ..
-        } => hid
-            .get_switch_matrix_with_rmk_byte_order(rows, cols, rmk_byte_order)
+        VialHidOperation::Matrix { rows, cols, .. } => hid
+            .get_switch_matrix(rows, cols)
             .map(VialHidOutcome::Matrix),
         VialHidOperation::BatteryRefresh => hid.get_battery_halves().map(VialHidOutcome::Battery),
         VialHidOperation::KeyWrite {
@@ -278,7 +272,7 @@ impl EntropyApp {
         let task_operation = operation.clone();
         std::thread::spawn(move || {
             #[cfg(target_os = "macos")]
-            let _hid_lock = crate::hid::macos_hid_operation_lock();
+            let _hid_lock = hid_device.macos_hid_operation_lock();
 
             let outcome = run_vial_hid_operation(&hid_device, operation.clone());
             let disconnected = outcome
@@ -333,7 +327,6 @@ impl EntropyApp {
             VialHidOperation::Matrix {
                 rows,
                 cols,
-                rmk_byte_order: self.matrix_tester_rmk_byte_order,
                 remember_ever_pressed,
             },
         )
@@ -448,6 +441,11 @@ impl EntropyApp {
                     _ => false,
                 };
                 self.finish_matrix_tester_poll(pressed, remember_ever_pressed);
+                if self.app_settings.sticky_layout_window {
+                    ctx.request_repaint_of(
+                        super::layout_indicator_window::sticky_layout_viewport_id(),
+                    );
+                }
             }
             Ok(VialHidOutcome::Battery(battery)) => {
                 if let Some(info) = self.device_about_info.as_mut() {
@@ -791,6 +789,9 @@ mod tests {
             supports_rmk_native_key_actions: false,
             supports_universal_symbols: false,
             supports_universal_russian_letters: false,
+            supports_rmk_native_combo_output: false,
+            supports_rmk_native_tap_dance_actions: false,
+            supports_rmk_combo_layers: false,
         })
     }
 
@@ -832,7 +833,6 @@ mod tests {
             VialHidOperation::Matrix {
                 rows: 2,
                 cols: 3,
-                rmk_byte_order: true,
                 remember_ever_pressed: true,
             },
         )
@@ -1197,6 +1197,7 @@ mod tests {
                 width: 2,
                 value: 32,
                 max: 255,
+                variants: Vec::new(),
             }),
             supported: true,
             ..LayerLedSettingsState::default()
@@ -1268,17 +1269,17 @@ mod tests {
         assert_eq!(requests.first().map(|request| request[0]), Some(0x12));
         assert!(module_set.is_some_and(|index| index > 0));
         assert!(layer_led_set.is_some_and(|index| Some(index) > module_set));
-        assert_eq!(
-            requests
-                .iter()
-                .filter(|request| {
-                    request[0] == 0xFE
-                        && matches!(request[1], 0x0A | 0x0B)
-                        && u16::from_le_bytes([request[2], request[3]]) == 316
-                })
-                .count(),
-            1
-        );
+        let layer_led_requests = requests
+            .iter()
+            .filter(|request| {
+                request[0] == 0xFE
+                    && matches!(request[1], 0x0A | 0x0B)
+                    && u16::from_le_bytes([request[2], request[3]]) == 316
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(layer_led_requests.len(), 2);
+        assert_eq!(layer_led_requests[0][1], 0x0B);
+        assert_eq!(layer_led_requests[1][1], 0x0A);
     }
 
     #[test]
