@@ -1,6 +1,7 @@
 use crate::firmware::FirmwareProtocol;
 
 const ERGOHAVEN_VENDOR_ID: u16 = 0xE126;
+const ERGOHAVEN_DISPLAY_MACROPAD_PRODUCT_IDS: [u16; 2] = [0x0041, 0x0042];
 const K04_QUBE_PRODUCT_ID_START: u16 = 0x0071;
 const K04_QUBE_PRODUCT_ID_END: u16 = 0x0073;
 
@@ -46,10 +47,235 @@ pub struct Device {
     pub bus_type: String,
     /// HID path used by Vial.
     pub path: String,
+    /// Identifies one concrete OS enumeration of this HID endpoint. On Linux
+    /// `/dev/hidrawN` can be reused after a quick unplug/replug, so the path
+    /// alone is not enough to decide that the existing open handle is alive.
+    #[serde(default)]
+    pub(crate) instance_token: String,
     pub firmware: FirmwareProtocol,
 }
 
 impl Device {
+    /// Conservative physical reservation policy shared by the UI and transport.
+    /// Endpoint equality always wins; a proven USB parent precedes serial hints.
+    /// Missing serials do not prove that two same-model keyboards are distinct.
+    pub(crate) fn may_share_physical_device(&self, other: &Device) -> bool {
+        if (!self.path.is_empty() && self.path.eq_ignore_ascii_case(&other.path))
+            || (!self.instance_token.is_empty() && self.instance_token == other.instance_token)
+        {
+            return true;
+        }
+        // USB serials and Bluetooth addresses are unrelated namespaces, but
+        // Ergohaven's assigned product families are shared across transports.
+        // A display macropad and a different Ergohaven product therefore are
+        // proven distinct even when one endpoint is Bluetooth. This lets the
+        // macropad's already-open clock owner coexist with the selected board
+        // without weakening the conservative fallback for unknown products.
+        if self.vendor_id == ERGOHAVEN_VENDOR_ID
+            && other.vendor_id == ERGOHAVEN_VENDOR_ID
+            && self.product_id != 0
+            && other.product_id != 0
+            && self.is_ergohaven_display_macropad() != other.is_ergohaven_display_macropad()
+        {
+            return false;
+        }
+        if let (Some(left), Some(right)) = (
+            self.linux_usb_physical_parent(),
+            other.linux_usb_physical_parent(),
+        ) {
+            return left == right;
+        }
+        let left = self.physical_aliases();
+        let right = other.physical_aliases();
+        if left.iter().any(|alias| right.contains(alias)) {
+            return true;
+        }
+        if !left.is_empty() && !right.is_empty() {
+            // USB manufacturer serials and Bluetooth addresses are different
+            // namespaces: disagreement across transports does not by itself
+            // prove that a dual-mode keyboard is a different physical device.
+            if self.is_bluetooth_transport() != other.is_bluetooth_transport() {
+                return true;
+            }
+            return false;
+        }
+        // Bluetooth service metadata may be absent or disagree with hidraw's
+        // VID/PID. Without addresses it cannot prove physical separation.
+        if self.is_bluetooth_transport() || other.is_bluetooth_transport() {
+            return true;
+        }
+        self.vendor_id == 0
+            || other.vendor_id == 0
+            || self.product_id == 0
+            || other.product_id == 0
+            || (self.vendor_id == other.vendor_id && self.product_id == other.product_id)
+    }
+
+    /// OS USB-device parent, not a serial, interface, or durable board identity.
+    /// Parse only the canonical Linux USB HID shape emitted by device_instance_token.
+    /// Unknown layouts preserve the existing conservative reservation policy.
+    fn linux_usb_physical_parent(&self) -> Option<&str> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if !self.bus_type.eq_ignore_ascii_case("usb") || self.is_bluetooth_transport() {
+                return None;
+            }
+            let digits =
+                |value: &str| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit());
+            if !digits(self.path.strip_prefix("/dev/hidraw")?) {
+                return None;
+            }
+            let canonical = self.instance_token.strip_prefix("sysfs:")?;
+            let relative = canonical.strip_prefix("/sys/devices/")?;
+            if relative
+                .split('/')
+                .any(|part| part.is_empty() || part == "." || part == "..")
+            {
+                return None;
+            }
+            let (interface_path, hid) = canonical.rsplit_once('/')?;
+            // PCI/interface names also contain colons; split only the HID basename.
+            let parts: Vec<_> = hid.split(':').collect();
+            if parts.len() != 3 && parts.len() != 5 {
+                return None;
+            }
+            if parts.len() == 5 && (!digits(parts[3]) || !digits(parts[4])) {
+                return None;
+            }
+            let (product, enumeration) = parts[2].split_once('.')?;
+            let hex = |value: &str| {
+                !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+            };
+            if parts[0] != "0003"
+                || parts[1].len() != 4
+                || !hex(parts[1])
+                || product.len() != 4
+                || !hex(product)
+                || !hex(enumeration)
+                || u16::from_str_radix(parts[1], 16).ok()? != self.vendor_id
+                || u16::from_str_radix(product, 16).ok()? != self.product_id
+            {
+                return None;
+            }
+            let (parent, interface) = interface_path.rsplit_once('/')?;
+            let usb_device = parent.rsplit('/').next()?;
+            let (bus, ports) = usb_device.split_once('-')?;
+            if !digits(bus)
+                || !ports.split('.').all(digits)
+                || !parent.contains(&format!("/usb{bus}/"))
+            {
+                return None;
+            }
+            let (configuration, number) = interface
+                .strip_prefix(usb_device)?
+                .strip_prefix(':')?
+                .split_once('.')?;
+            if !digits(configuration) || !digits(number) {
+                return None;
+            }
+            Some(parent)
+        }
+    }
+
+    fn physical_aliases(&self) -> Vec<String> {
+        let mut aliases = Vec::new();
+        let serial = normalized_device_identity(&self.serial_number);
+        if !serial.is_empty() {
+            aliases.push(serial);
+        }
+        if let Some(address) = bluez_path_address(&self.path) {
+            if !aliases.contains(&address) {
+                aliases.push(address);
+            }
+        }
+        aliases
+    }
+
+    /// Strong identity for an actual open, deliberately stricter than the
+    /// conservative reservation overlap policy. Product names are not identity.
+    pub(crate) fn permits_hid_target(&self, actual: &Device) -> bool {
+        #[cfg(target_os = "linux")]
+        if actual.path.starts_with("/dev/hidraw")
+            && (!actual.instance_token.starts_with("sysfs:")
+                || (self.path == actual.path && !self.instance_token.starts_with("sysfs:")))
+        {
+            return false;
+        }
+        if let Some(expected_parent) = self.linux_usb_physical_parent() {
+            if actual.linux_usb_physical_parent() != Some(expected_parent) {
+                return false;
+            }
+        }
+        let bluetooth = self.is_bluetooth_transport();
+        if bluetooth != actual.is_bluetooth_transport() {
+            return false;
+        }
+        let expected_address = self.bluetooth_address();
+        let actual_address = actual.bluetooth_address();
+        let same_address =
+            bluetooth && expected_address.is_some() && expected_address == actual_address;
+        // BlueZ's Modalias may be absent or differ from the kernel's IDs. Only
+        // a proven matching Bluetooth address can override that metadata, never
+        // a product/manufacturer string or a missing serial.
+        if (self.vendor_id != actual.vendor_id || self.product_id != actual.product_id)
+            && !same_address
+        {
+            return false;
+        }
+        let serial_matches = if bluetooth {
+            !self.serial_number.trim().is_empty()
+                && normalized_device_identity(&self.serial_number)
+                    == normalized_device_identity(&actual.serial_number)
+        } else {
+            !self.serial_number.trim().is_empty() && self.serial_number == actual.serial_number
+        };
+        if !self.serial_number.trim().is_empty() && !serial_matches && !same_address {
+            return false;
+        }
+        // Reject internally contradictory cached/service identities as well.
+        for description in [self, actual] {
+            if bluez_path_address(&description.path).is_some()
+                && description.bluetooth_address().is_none()
+            {
+                return false;
+            }
+        }
+        if bluez_path_address(&self.path).is_some() && !same_address {
+            return false;
+        }
+        let same_path = self.path == actual.path;
+        if same_path
+            && !self.instance_token.is_empty()
+            && self.instance_token != actual.instance_token
+        {
+            return false;
+        }
+        // Serial-less fallback by VID/PID/name is unsafe. A path-encoded owning
+        // Bluetooth address is strong evidence, not a serial-less substitution.
+        if !serial_matches && !same_address {
+            return same_path
+                && !self.path.is_empty()
+                && (!cfg!(target_os = "linux") || !self.instance_token.is_empty());
+        }
+        true
+    }
+
+    fn bluetooth_address(&self) -> Option<String> {
+        if !self.is_bluetooth_transport() {
+            return None;
+        }
+        let path_address = bluez_path_address(&self.path);
+        let serial = normalized_device_identity(&self.serial_number);
+        if let Some(path_address) = path_address {
+            return (serial.is_empty() || serial == path_address).then_some(path_address);
+        }
+        (serial.len() == 12 && serial.bytes().all(|b| b.is_ascii_hexdigit())).then_some(serial)
+    }
+
     pub(crate) fn stable_identity(&self) -> DeviceIdentity {
         DeviceIdentity {
             vendor_id: self.vendor_id,
@@ -64,7 +290,7 @@ impl Device {
     pub fn is_bluetooth_transport(&self) -> bool {
         self.bus_type.eq_ignore_ascii_case("bluetooth") || {
             let path = self.path.to_ascii_lowercase();
-            path.contains("bth") || path.contains("bluetooth")
+            path.contains("bth") || path.contains("bluetooth") || path.starts_with("bluez-gatt:")
         }
     }
 
@@ -96,10 +322,81 @@ impl Device {
         }
     }
 
+    pub(crate) fn is_ergohaven_display_macropad(&self) -> bool {
+        self.vendor_id == ERGOHAVEN_VENDOR_ID
+            && ERGOHAVEN_DISPLAY_MACROPAD_PRODUCT_IDS.contains(&self.product_id)
+    }
+
     fn is_k04_qube(&self) -> bool {
         self.vendor_id == ERGOHAVEN_VENDOR_ID
             && (K04_QUBE_PRODUCT_ID_START..=K04_QUBE_PRODUCT_ID_END).contains(&self.product_id)
     }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn device_instance_token(path: &str) -> String {
+    use std::os::unix::fs::MetadataExt;
+
+    // The devtmpfs node can reuse both `/dev/hidrawN` and its device number
+    // after a quick replug. The sysfs HID instance path ends in a kernel
+    // enumeration id (for example `.0007`) and therefore changes for every
+    // concrete USB attachment.
+    let sysfs_device = std::path::Path::new(path).file_name().map(|name| {
+        std::path::Path::new("/sys/class/hidraw")
+            .join(name)
+            .join("device")
+    });
+    if let Some(sysfs_device) = sysfs_device {
+        if let Ok(canonical) = std::fs::canonicalize(&sysfs_device) {
+            if let Ok(metadata) = std::fs::metadata(&canonical) {
+                return format!(
+                    "sysfs:{}:{}:{}",
+                    canonical.display(),
+                    metadata.dev(),
+                    metadata.ino()
+                );
+            }
+            return format!("sysfs:{}", canonical.display());
+        }
+    }
+
+    // A devtmpfs path/device number is not a concrete hidraw enumeration.
+    // Missing sysfs identity must remain unavailable rather than becoming the
+    // path itself (which can be immediately reused by another attachment).
+    if path.starts_with("/dev/hidraw") {
+        return String::new();
+    }
+    std::fs::metadata(path)
+        .map(|metadata| {
+            format!(
+                "dev:{}:{}:{}",
+                metadata.dev(),
+                metadata.ino(),
+                metadata.rdev()
+            )
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn device_instance_token(path: &str) -> String {
+    path.to_owned()
+}
+
+/// Address alias encoded in BlueZ's owning Device1 object path. This is
+/// platform independent so imported/cached device descriptions compare alike.
+pub(crate) fn bluez_path_address(path: &str) -> Option<String> {
+    let path = path.strip_prefix("bluez-gatt:").unwrap_or(path);
+    let owner = path.split('/').find_map(|part| part.strip_prefix("dev_"))?;
+    let parts: Vec<_> = owner.split('_').collect();
+    if parts.len() != 6
+        || parts
+            .iter()
+            .any(|p| p.len() != 2 || !p.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        return None;
+    }
+    Some(parts.concat().to_ascii_lowercase())
 }
 
 fn normalized_device_identity(value: &str) -> String {
@@ -110,12 +407,33 @@ fn normalized_device_identity(value: &str) -> String {
         .collect()
 }
 
+/// Synthetic kernel enumeration for pure identity and inert owner tests only.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn test_usb_device(port: &str, hidraw: u8, product_id: u16) -> Device {
+    Device {
+        name: "USB identity fixture".into(),
+        vendor_id: 0xE126,
+        product_id,
+        manufacturer: "fixture".into(),
+        serial_number: "vial:f64c2b3c".into(),
+        bus_type: "Usb".into(),
+        path: format!("/dev/hidraw{hidraw}"),
+        instance_token: format!("sysfs:/sys/devices/pci0000:00/controller/usb3/{port}/{port}:1.1/0003:E126:{product_id:04X}.00{hidraw:02X}:23:{}", 1000 + u16::from(hidraw)),
+        firmware: FirmwareProtocol::Vial,
+    }
+}
+
 /// Scans for connected Vial HID keyboard devices.
 pub struct DeviceManager {
     devices: Vec<Device>,
 }
 
 impl DeviceManager {
+    #[cfg(test)]
+    pub(crate) fn empty_for_test() -> Self {
+        Self { devices: vec![] }
+    }
+
     pub fn new() -> Self {
         #[cfg(not(target_os = "macos"))]
         {
@@ -133,51 +451,55 @@ impl DeviceManager {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn scan_devices() -> Vec<Device> {
+    pub fn scan_devices() -> Result<Vec<Device>, String> {
         let mut devices = Vec::new();
 
         #[cfg(target_os = "macos")]
         if crate::hid::macos_hid_scan_disabled_for_rosetta() {
-            return devices;
+            return Ok(devices);
         }
 
         #[cfg(target_os = "macos")]
         let _hid_lock = crate::hid::macos_hid_operation_lock();
-        if let Ok(api) = hidapi::HidApi::new() {
-            for info in api.device_list() {
-                // Filter: Vial usage page 0xFF60, usage 0x61
-                if info.usage_page() == 0xFF60 && info.usage() == 0x61 {
-                    devices.push(Device {
-                        name: info
-                            .product_string()
-                            .unwrap_or("Unknown Keyboard")
-                            .to_string(),
-                        vendor_id: info.vendor_id(),
-                        product_id: info.product_id(),
-                        manufacturer: info.manufacturer_string().unwrap_or("").to_string(),
-                        serial_number: info.serial_number().unwrap_or("").to_string(),
-                        bus_type: format!("{:?}", info.bus_type()),
-                        path: info.path().to_string_lossy().to_string(),
-                        firmware: FirmwareProtocol::Vial,
-                    });
-                }
+        let api = hidapi::HidApi::new().map_err(|error| format!("HID scan failed: {error}"))?;
+        for info in api.device_list() {
+            // Filter: Vial usage page 0xFF60, usage 0x61
+            if info.usage_page() == 0xFF60 && info.usage() == 0x61 {
+                let path = info.path().to_string_lossy().to_string();
+                devices.push(Device {
+                    name: info
+                        .product_string()
+                        .unwrap_or("Unknown Keyboard")
+                        .to_string(),
+                    vendor_id: info.vendor_id(),
+                    product_id: info.product_id(),
+                    manufacturer: info.manufacturer_string().unwrap_or("").to_string(),
+                    serial_number: info.serial_number().unwrap_or("").to_string(),
+                    bus_type: format!("{:?}", info.bus_type()),
+                    instance_token: device_instance_token(&path),
+                    path,
+                    firmware: FirmwareProtocol::Vial,
+                });
             }
         }
 
         #[cfg(target_os = "linux")]
         {
             deduplicate_kernel_bluetooth_devices(&mut devices);
-            let bluez_devices = crate::linux_ble::scan_devices();
+            let bluez_devices = crate::linux_ble::scan_devices_cached_nonblocking();
             merge_bluez_vial_devices(&mut devices, bluez_devices);
         }
 
-        devices
+        Ok(devices)
     }
 
     pub fn scan(&mut self) {
         #[cfg(not(target_arch = "wasm32"))]
         {
-            self.devices = Self::scan_devices();
+            match Self::scan_devices() {
+                Ok(devices) => self.devices = devices,
+                Err(error) => log::warn!("{error}"),
+            }
         }
 
         log::info!("Found {} Vial device(s)", self.devices.len());
@@ -266,8 +588,165 @@ mod tests {
             serial_number: "serial".to_owned(),
             bus_type: bus_type.to_owned(),
             path: path.to_owned(),
+            instance_token: path.to_owned(),
             firmware: FirmwareProtocol::Vial,
         }
+    }
+
+    #[test]
+    fn physical_reservation_policy_is_conservative_and_symmetric() {
+        let a = test_device("Usb", "endpoint-A");
+        let mut b = a.clone();
+        b.path = "endpoint-B".into();
+        b.instance_token = b.path.clone();
+        assert!(a.may_share_physical_device(&b));
+        b.serial_number = "different-serial".into();
+        assert!(!a.may_share_physical_device(&b));
+        assert!(!b.may_share_physical_device(&a));
+        b.path = a.path.clone();
+        assert!(a.may_share_physical_device(&b));
+        b.path = "endpoint-B".into();
+        b.serial_number.clear();
+        assert!(a.may_share_physical_device(&b));
+        assert!(b.may_share_physical_device(&a));
+        b.name = "Not identity evidence".into();
+        assert!(a.may_share_physical_device(&b));
+    }
+
+    #[test]
+    fn physical_reservation_covers_bluez_address_and_hidraw_aliases() {
+        let mut a = test_device(
+            "Bluetooth",
+            "bluez-gatt:/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/service0010",
+        );
+        a.serial_number.clear();
+        let mut b = test_device("Bluetooth", "/dev/hidraw9");
+        b.serial_number = "aa:bb:cc:dd:ee:ff".into();
+        b.product_id += 1;
+        assert!(a.may_share_physical_device(&b));
+        assert!(b.may_share_physical_device(&a));
+        b.serial_number = "11:22:33:44:55:66".into();
+        assert!(!a.may_share_physical_device(&b));
+        b.serial_number.clear();
+        assert!(a.may_share_physical_device(&b));
+    }
+
+    #[test]
+    fn strict_open_never_substitutes_same_product_different_serial() {
+        let a = test_device("Usb", "endpoint-A");
+        let mut b = a.clone();
+        b.serial_number = "different-serial".into();
+        assert!(!a.permits_hid_target(&b));
+        b.path = "fallback".into();
+        b.instance_token = b.path.clone();
+        assert!(!a.permits_hid_target(&b));
+        b.serial_number = a.serial_number.clone();
+        assert!(a.permits_hid_target(&b));
+        b.product_id += 1;
+        assert!(!a.permits_hid_target(&b));
+    }
+
+    #[test]
+    fn strict_open_rejects_reused_instance_and_serial_less_fallback() {
+        let mut a = test_device("Usb", "endpoint-A");
+        let mut b = a.clone();
+        b.instance_token = "reused-enumeration".into();
+        assert!(!a.permits_hid_target(&b));
+        a.serial_number.clear();
+        b = a.clone();
+        assert!(a.permits_hid_target(&b));
+        b.path = "fallback".into();
+        b.instance_token = "fallback-instance".into();
+        assert!(!a.permits_hid_target(&b));
+    }
+
+    #[test]
+    fn strict_bluetooth_fallback_requires_owning_address() {
+        let mut a = test_device(
+            "Bluetooth",
+            "bluez-gatt:/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/service0010",
+        );
+        a.serial_number = "AA:BB:CC:DD:EE:FF".into();
+        let mut b = a.clone();
+        b.path = "/dev/hidraw9".into();
+        b.instance_token = "sysfs:/fake/kernel.0001".into();
+        b.serial_number = "aa-bb-cc-dd-ee-ff".into();
+        assert!(a.permits_hid_target(&b));
+        b.serial_number = "11:22:33:44:55:66".into();
+        assert!(!a.permits_hid_target(&b));
+        a.serial_number = b.serial_number.clone();
+        assert!(!a.permits_hid_target(&b));
+    }
+
+    #[test]
+    fn strong_bluez_address_survives_missing_or_different_modalias() {
+        let mut expected = test_device(
+            "Bluetooth",
+            "bluez-gatt:/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/service0010",
+        );
+        expected.serial_number.clear();
+        expected.vendor_id = 0;
+        expected.product_id = 0;
+        let mut kernel = test_device("Bluetooth", "/dev/hidraw7");
+        kernel.serial_number = "AA:BB:CC:DD:EE:FF".into();
+        kernel.instance_token = "sysfs:/fake/kernel.0002".into();
+        assert!(expected.permits_hid_target(&kernel));
+        kernel.serial_number = "11:22:33:44:55:66".into();
+        assert!(!expected.permits_hid_target(&kernel));
+    }
+
+    #[test]
+    fn usb_serial_and_bluetooth_address_are_not_proof_of_distinct_hardware() {
+        let mut usb = test_device("Usb", "usb-endpoint");
+        usb.serial_number = "manufacturer-serial".into();
+        let mut bluetooth = test_device("Bluetooth", "bluetooth-endpoint");
+        bluetooth.serial_number = "AA:BB:CC:DD:EE:FF".into();
+        assert!(usb.may_share_physical_device(&bluetooth));
+        assert!(bluetooth.may_share_physical_device(&usb));
+    }
+
+    #[test]
+    fn hex_usb_serial_is_not_bluetooth_address_provenance() {
+        let mut usb = test_device("Usb", "usb-endpoint");
+        usb.serial_number = "123456789abc".into();
+        let mut bluetooth = test_device("Bluetooth", "bluetooth-endpoint");
+        bluetooth.serial_number = "AA:BB:CC:DD:EE:FF".into();
+        assert!(usb.may_share_physical_device(&bluetooth));
+        assert!(bluetooth.may_share_physical_device(&usb));
+    }
+
+    #[test]
+    fn display_macropad_and_other_ergohaven_bluetooth_product_are_distinct() {
+        let mut macropad = test_device("Usb", "usb-macropad");
+        macropad.vendor_id = ERGOHAVEN_VENDOR_ID;
+        macropad.product_id = 0x0042;
+        macropad.serial_number = "vial:f64c2b3c".into();
+        let mut bluetooth = test_device("Bluetooth", "bluetooth-keyboard");
+        bluetooth.vendor_id = ERGOHAVEN_VENDOR_ID;
+        bluetooth.product_id = 0x00A1;
+        bluetooth.serial_number = "AA:BB:CC:DD:EE:FF".into();
+
+        assert!(!macropad.may_share_physical_device(&bluetooth));
+        assert!(!bluetooth.may_share_physical_device(&macropad));
+
+        bluetooth.product_id = 0x0041;
+        assert!(macropad.may_share_physical_device(&bluetooth));
+        assert!(bluetooth.may_share_physical_device(&macropad));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn missing_or_path_only_hidraw_instance_fails_closed() {
+        let mut expected = test_device("Usb", "/dev/hidraw999999999");
+        assert!(device_instance_token(&expected.path).is_empty());
+        assert!(!expected.permits_hid_target(&expected));
+        expected.instance_token.clear();
+        assert!(!expected.permits_hid_target(&expected));
+        expected.instance_token = "sysfs:/fake/kernel.0001".into();
+        assert!(expected.permits_hid_target(&expected));
+        let mut reused = expected.clone();
+        reused.instance_token = "sysfs:/fake/kernel.0002".into();
+        assert!(!expected.permits_hid_target(&reused));
     }
 
     #[test]
@@ -486,5 +965,149 @@ mod tests {
         deduplicate_kernel_bluetooth_devices(&mut devices);
 
         assert_eq!(devices.len(), 2);
+    }
+}
+#[cfg(all(test, target_os = "linux"))]
+mod usb_parent_tests {
+    use super::*;
+
+    #[test]
+    fn generic_usb_serial_does_not_merge_distinct_parents() {
+        let a = test_usb_device("3-3", 5, 0x42);
+        for product in [0x42, 0xA1] {
+            let mut b = test_usb_device("3-2", 9, product);
+            assert!(!a.may_share_physical_device(&b));
+            assert!(!b.may_share_physical_device(&a));
+            b.serial_number.clear();
+            assert!(!a.may_share_physical_device(&b));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn generic_usb_serial_never_allows_opening_another_parent() {
+        let a = test_usb_device("3-3", 5, 0x42);
+        let mut b = test_usb_device("3-2", 9, 0x42);
+        assert!(!a.permits_hid_target(&b));
+        assert!(!b.permits_hid_target(&a));
+        b.instance_token = "sysfs:/fake/kernel.0001".into();
+        assert!(!a.permits_hid_target(&b));
+        assert!(a.permits_hid_target(&a));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn generic_usb_serial_composite_interfaces_remain_reserved() {
+        let a = test_usb_device("3-3", 5, 0x42);
+        let mut b = test_usb_device("3-3", 6, 0x42);
+        b.instance_token = b.instance_token.replace(":1.1/", ":1.2/");
+        assert!(a.may_share_physical_device(&b));
+        assert!(a.permits_hid_target(&b));
+        b.serial_number = "different-interface-hint".into();
+        assert!(a.may_share_physical_device(&b));
+        assert!(b.may_share_physical_device(&a));
+        assert!(!a.permits_hid_target(&b));
+    }
+
+    #[test]
+    fn unknown_usb_parent_and_bluetooth_keep_conservative_reservations() {
+        let a = test_usb_device("3-3", 5, 0x43);
+        let original = test_usb_device("3-2", 9, 0xA1);
+        for token in [
+            "",
+            "fallback-instance",
+            "sysfs:/fake/kernel.0001",
+            "sysfs:/sys/devices/virtual/hidraw/0003:E126:00A1.0024",
+        ] {
+            let mut b = original.clone();
+            b.instance_token = token.into();
+            assert!(b.linux_usb_physical_parent().is_none());
+            assert!(a.may_share_physical_device(&b));
+            assert!(b.may_share_physical_device(&a));
+        }
+        let mut bluetooth = original;
+        bluetooth.bus_type = "Bluetooth".into();
+        bluetooth.serial_number = "AA:BB:CC:DD:EE:FF".into();
+        assert!(bluetooth.linux_usb_physical_parent().is_none());
+        assert!(a.may_share_physical_device(&bluetooth));
+        assert!(bluetooth.may_share_physical_device(&a));
+    }
+
+    #[test]
+    fn usb_parent_never_overrides_endpoint_or_reenumeration_fences() {
+        let a = test_usb_device("3-3", 5, 0x42);
+        let mut b = test_usb_device("3-2", 9, 0x42);
+        b.path = a.path.clone();
+        assert!(a.may_share_physical_device(&b));
+        assert!(!a.permits_hid_target(&b));
+        b.path = "/dev/hidraw99".into();
+        b.instance_token = a.instance_token.clone();
+        assert!(a.may_share_physical_device(&b));
+        b = a.clone();
+        b.instance_token = b.instance_token.replace(".0005", ".0100");
+        assert_eq!(a.linux_usb_physical_parent(), b.linux_usb_physical_parent());
+        assert!(a.may_share_physical_device(&b));
+        assert!(!a.permits_hid_target(&b));
+    }
+
+    #[test]
+    fn usb_parent_preserves_complete_controller_and_nested_hub_hierarchy() {
+        let a = test_usb_device("3-3", 5, 0x42);
+        let mut other_controller = a.clone();
+        other_controller.path = "/dev/hidraw7".into();
+        other_controller.instance_token = a
+            .instance_token
+            .replace("/controller/", "/other-controller/");
+        assert!(!a.may_share_physical_device(&other_controller));
+        let mut hub_a = test_usb_device("3-3.2", 5, 0x42);
+        let mut hub_b = test_usb_device("3-3.3", 9, 0x42);
+        hub_a.instance_token = hub_a.instance_token.replace("/usb3/", "/usb3/3-3/");
+        hub_b.instance_token = hub_b.instance_token.replace("/usb3/", "/usb3/3-3/");
+        assert!(hub_a
+            .linux_usb_physical_parent()
+            .unwrap()
+            .ends_with("/3-3/3-3.2"));
+        assert!(!hub_a.may_share_physical_device(&hub_b));
+        let mut no_metadata = a.clone();
+        no_metadata.instance_token = no_metadata
+            .instance_token
+            .strip_suffix(":23:1005")
+            .unwrap()
+            .into();
+        assert_eq!(
+            a.linux_usb_physical_parent(),
+            no_metadata.linux_usb_physical_parent()
+        );
+    }
+
+    #[test]
+    fn malformed_usb_parent_never_grants_separation() {
+        let a = test_usb_device("3-3", 5, 0x42);
+        for (from, to) in [
+            ("/3-3:1.1/", "/3-2:1.1/"),
+            ("0003:E126", "0005:E126"),
+            ("E126:0042", "E126:00A1"),
+            ("/usb3/", "/usb9/"),
+            (":23:1005", ":dev:ino"),
+            ("/3-3/", "/../3-3/"),
+            ("/3-3/", "//3-3/"),
+            (".0005", ".xxxx"),
+        ] {
+            let mut b = a.clone();
+            b.path = "/dev/hidraw9".into();
+            b.instance_token = b.instance_token.replace(from, to);
+            assert!(b.linux_usb_physical_parent().is_none(), "{from} -> {to}");
+            assert!(a.may_share_physical_device(&b));
+        }
+        for bus in ["", "Unknown", "Bluetooth", "I2c"] {
+            let mut b = a.clone();
+            b.bus_type = bus.into();
+            assert!(b.linux_usb_physical_parent().is_none());
+        }
+        for path in ["/dev/hidraw", "/dev/hidraw5/extra", "endpoint-A"] {
+            let mut b = a.clone();
+            b.path = path.into();
+            assert!(b.linux_usb_physical_parent().is_none());
+        }
     }
 }

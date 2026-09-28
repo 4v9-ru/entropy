@@ -4,14 +4,11 @@ use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-#[cfg(target_os = "windows")]
-use std::io::{BufRead, BufReader, Write};
-
-#[cfg(target_os = "windows")]
-use std::process::{Child, ChildStdin, Command, Stdio};
-
-#[cfg(target_os = "windows")]
-use std::sync::{mpsc, Mutex};
+#[path = "hid_proxy.rs"]
+mod hid_proxy;
+pub use hid_proxy::run_hid_proxy_if_requested;
+use hid_proxy::HidProxy;
+pub(crate) use hid_proxy::{claim_open_target, HidRetirement};
 
 #[path = "hid_protocol.rs"]
 pub(crate) mod hid_protocol;
@@ -97,6 +94,10 @@ fn macos_running_under_rosetta() -> bool {
 
 const VIAL_GUI_USB_RETRIES: usize = 20;
 const VIAL_GUI_READ_TIMEOUT_MS: i32 = 500;
+// Firmware 4.0.6 performs the flash update synchronously before acknowledging
+// SLOT_COMMIT. It remains enumerated, but regularly exceeds the generic USB
+// response window; timing out here incorrectly tears down the whole connection.
+const PICTOGRAM_SLOT_COMMIT_READ_TIMEOUT_MS: i32 = 2_500;
 const WINDOWS_BLE_READ_TIMEOUT_MS: i32 = 2_500;
 const WINDOWS_BLE_READ_SLICE_MS: i32 = 250;
 const WINDOWS_BLE_SETTLE_DELAY: Duration = Duration::from_millis(12);
@@ -104,12 +105,6 @@ const WINDOWS_BLE_SETTLE_DELAY: Duration = Duration::from_millis(12);
 const LINUX_BLE_NOTIFICATION_PROBE_TIMEOUT_MS: i32 = 80;
 #[cfg(target_os = "linux")]
 const LINUX_BLE_UNCORRELATED_REPLY_SETTLE: Duration = Duration::from_millis(32);
-#[cfg(target_os = "windows")]
-const WINDOWS_HID_HELPER_USB_COMMAND_TIMEOUT: Duration = Duration::from_millis(1_500);
-#[cfg(target_os = "windows")]
-const WINDOWS_HID_HELPER_BLE_COMMAND_TIMEOUT: Duration = Duration::from_secs(8);
-#[cfg(target_os = "windows")]
-const HID_PROXY_OUTPUT_PREFIX: &str = "output:";
 const VIAL_GUI_RETRY_DELAY: Duration = Duration::from_millis(500);
 const HID_OPEN_RETRIES: usize = 5;
 const HID_OPEN_RETRY_DELAY: Duration = Duration::from_millis(250);
@@ -197,11 +192,23 @@ pub struct HidDevice {
 #[cfg(test)]
 #[derive(Clone)]
 pub(crate) struct TestHidRecorder {
+    host_output: std::sync::Arc<crate::qmk_hid_host::HostOutputOwner>,
+    pictogram_backup_directory: std::sync::Arc<std::sync::Mutex<Option<PathBuf>>>,
     requests: std::sync::Arc<std::sync::Mutex<Vec<[u8; MSG_LEN]>>>,
+    responses: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<[u8; MSG_LEN]>>>,
 }
 
 #[cfg(test)]
 impl TestHidRecorder {
+    // Per scripted physical owner; survives moving the HID device into its worker.
+    pub(crate) fn set_pictogram_backup_directory(&self, directory: PathBuf) {
+        *self.pictogram_backup_directory.lock().unwrap() = Some(directory);
+    }
+
+    pub(crate) fn respond_with(&self, responses: impl IntoIterator<Item = [u8; MSG_LEN]>) {
+        self.responses.lock().unwrap().extend(responses);
+    }
+
     pub(crate) fn requests(&self) -> Vec<[u8; MSG_LEN]> {
         self.requests
             .lock()
@@ -228,7 +235,6 @@ enum HidBackend {
         path: Option<PathBuf>,
         input_report_polling: std::sync::atomic::AtomicBool,
     },
-    #[cfg(target_os = "windows")]
     Proxy(std::sync::Arc<HidProxy>),
     #[cfg(target_os = "linux")]
     LinuxBle(crate::linux_ble::LinuxBleDevice),
@@ -315,7 +321,6 @@ impl HidDevice {
     pub fn is_bluetooth_transport(&self) -> bool {
         match &self.backend {
             HidBackend::Local { transport, .. } => transport.is_bluetooth(),
-            #[cfg(target_os = "windows")]
             HidBackend::Proxy(proxy) => proxy.is_bluetooth_transport(),
             #[cfg(target_os = "linux")]
             HidBackend::LinuxBle(_) => true,
@@ -331,54 +336,90 @@ impl HidDevice {
             return None;
         }
 
+        if matches!(&self.backend, HidBackend::Proxy(_)) {
+            return None;
+        }
         Some(macos_hid_operation_lock())
     }
-}
-
-#[cfg(target_os = "windows")]
-struct HidProxy {
-    request_lock: Mutex<()>,
-    child: Mutex<Child>,
-    stdin: Mutex<ChildStdin>,
-    rx: Mutex<mpsc::Receiver<String>>,
-    transport: HidTransport,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone)]
 pub(crate) struct SharedHidOutput {
     backend: SharedHidOutputBackend,
+    host_output: std::sync::Arc<crate::qmk_hid_host::HostOutputOwner>,
+    host_lease: Option<crate::qmk_hid_host::HostOutputLease>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone)]
 enum SharedHidOutputBackend {
-    #[cfg(target_os = "windows")]
     Proxy(std::sync::Weak<HidProxy>),
     #[cfg(test)]
     Test(TestHidRecorder),
-    #[cfg(not(any(target_os = "windows", test)))]
-    #[allow(dead_code)]
-    Unavailable,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 impl SharedHidOutput {
-    pub(crate) fn is_available(&self) -> bool {
-        match &self.backend {
-            #[cfg(target_os = "windows")]
-            SharedHidOutputBackend::Proxy(proxy) => proxy.strong_count() > 0,
-            #[cfg(test)]
-            SharedHidOutputBackend::Test(_) => true,
-            #[cfg(not(any(target_os = "windows", test)))]
-            SharedHidOutputBackend::Unavailable => false,
+    pub(crate) fn shares_owner_with(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.host_output, &other.host_output)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_expired_proxy_owner() -> Self {
+        Self {
+            host_output: Default::default(),
+            host_lease: None,
+            backend: SharedHidOutputBackend::Proxy(std::sync::Weak::new()),
         }
     }
 
+    pub(crate) fn is_available(&self) -> bool {
+        match &self.backend {
+            SharedHidOutputBackend::Proxy(proxy) => {
+                proxy.upgrade().is_some_and(|proxy| proxy.is_available())
+            }
+            #[cfg(test)]
+            SharedHidOutputBackend::Test(_) => true,
+        }
+    }
+
+    pub(crate) fn for_host_bridge(
+        &self,
+        mode: crate::qmk_hid_host::HostDataMode,
+        extended: bool,
+    ) -> Self {
+        let mut output = self.clone();
+        output.host_lease = Some(self.host_output.claim(mode, extended));
+        output
+    }
+
+    pub(crate) fn host_session_is_current(&self) -> bool {
+        self.host_lease
+            .as_ref()
+            .is_none_or(|lease| lease.is_current())
+    }
+
+    pub(crate) fn write_host_shutdown(&self, payloads: &[Vec<u8>]) -> Result<()> {
+        if let Some(lease) = self.host_lease.as_ref() {
+            return lease.shutdown(|payload| self.write_output_report_unordered(payload));
+        }
+        for payload in payloads {
+            self.write_output_report_unordered(payload)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn write_output_report(&self, data: &[u8]) -> Result<()> {
+        if let Some(lease) = self.host_lease.as_ref() {
+            return lease.write(data, |payload| self.write_output_report_unordered(payload));
+        }
+        self.write_output_report_unordered(data)
+    }
+
+    fn write_output_report_unordered(&self, data: &[u8]) -> Result<()> {
         ensure_output_report_len(data)?;
         match &self.backend {
-            #[cfg(target_os = "windows")]
             SharedHidOutputBackend::Proxy(proxy) => proxy
                 .upgrade()
                 .context("Shared HID output owner is no longer available")?
@@ -388,28 +429,6 @@ impl SharedHidOutput {
                 record_test_output_report(recorder, data);
                 Ok(())
             }
-            #[cfg(not(any(target_os = "windows", test)))]
-            SharedHidOutputBackend::Unavailable => {
-                bail!("Shared HID output is unavailable on this platform")
-            }
-        }
-    }
-}
-
-#[cfg(target_os = "windows")]
-#[derive(serde::Serialize, serde::Deserialize)]
-struct ProxyResponse {
-    ok: bool,
-    data: Option<String>,
-    error: Option<String>,
-}
-
-#[cfg(target_os = "windows")]
-impl Drop for HidProxy {
-    fn drop(&mut self) {
-        if let Ok(child) = self.child.get_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
         }
     }
 }
@@ -452,43 +471,25 @@ pub fn is_disconnect_error(error: &anyhow::Error) -> bool {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn device_info_matches(
-    info: &hidapi::DeviceInfo,
-    device: &crate::device::Device,
-    strict_identity: bool,
-) -> bool {
-    if info.usage_page() != 0xFF60
-        || info.usage() != 0x61
-        || info.vendor_id() != device.vendor_id
-        || info.product_id() != device.product_id
-    {
-        return false;
+fn device_info_matches(info: &hidapi::DeviceInfo, device: &crate::device::Device) -> bool {
+    info.usage_page() == 0xFF60
+        && info.usage() == 0x61
+        && device.permits_hid_target(&device_from_info(info))
+}
+
+fn device_from_info(info: &hidapi::DeviceInfo) -> crate::device::Device {
+    let path = info.path().to_string_lossy().into_owned();
+    crate::device::Device {
+        name: info.product_string().unwrap_or_default().to_owned(),
+        vendor_id: info.vendor_id(),
+        product_id: info.product_id(),
+        manufacturer: info.manufacturer_string().unwrap_or_default().to_owned(),
+        serial_number: info.serial_number().unwrap_or_default().to_owned(),
+        bus_type: format!("{:?}", info.bus_type()),
+        instance_token: crate::device::device_instance_token(&path),
+        path,
+        firmware: crate::firmware::FirmwareProtocol::Vial,
     }
-
-    if device.is_bluetooth_transport() && !matches!(info.bus_type(), hidapi::BusType::Bluetooth) {
-        return false;
-    }
-
-    if !strict_identity {
-        return true;
-    }
-
-    let serial_matches = !device.serial_number.is_empty()
-        && info
-            .serial_number()
-            .map(|serial| serial == device.serial_number)
-            .unwrap_or(false);
-    let product_matches = info
-        .product_string()
-        .map(|product| product == device.name)
-        .unwrap_or(false);
-    let manufacturer_matches = device.manufacturer.is_empty()
-        || info
-            .manufacturer_string()
-            .map(|manufacturer| manufacturer == device.manufacturer)
-            .unwrap_or(false);
-
-    serial_matches || (product_matches && manufacturer_matches)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -503,7 +504,10 @@ impl HidDevice {
         fault_after_requests: Option<(usize, TestHidFault)>,
     ) -> (Self, TestHidRecorder) {
         let recorder = TestHidRecorder {
+            host_output: Default::default(),
+            pictogram_backup_directory: Default::default(),
             requests: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            responses: Default::default(),
         };
         let device = Self {
             backend: HidBackend::Test {
@@ -516,68 +520,63 @@ impl HidDevice {
         (device, recorder)
     }
 
-    pub fn open(path: &str) -> Result<Self> {
-        #[cfg(target_os = "macos")]
-        let _hid_lock = macos_hid_operation_lock();
-        let api = hidapi::HidApi::new().context("Failed to init hidapi")?;
-        let device = api
-            .open_path(&std::ffi::CString::new(path)?)
-            .context("Failed to open HID device")?;
-        Ok(Self {
-            backend: HidBackend::Local {
-                device,
-                transport: HidTransport::Usb,
-                write_framing: HidWriteFraming::ReportIdPrefixed(0),
-                path: Some(PathBuf::from(path)),
-                input_report_polling: std::sync::atomic::AtomicBool::new(false),
-            },
-        })
+    #[cfg(test)]
+    pub(crate) fn test_pictogram_backup_directory(&self) -> Result<Option<PathBuf>> {
+        if let HidBackend::Test { recorder, .. } = &self.backend {
+            // Never let a scripted upload write into the real user's library.
+            return recorder
+                .pictogram_backup_directory
+                .lock()
+                .unwrap()
+                .clone()
+                .map(Some)
+                .context("Scripted pictogram upload requires a per-test backup directory");
+        }
+        Ok(None)
     }
 
     pub fn open_fresh_for(device: &crate::device::Device) -> Result<Self> {
+        Self::open_proxy_for(device)
+    }
+
+    // Called only by the helper on its main thread, never by the UI process.
+    fn open_in_helper(device: &crate::device::Device) -> Result<Self> {
         #[cfg(target_os = "linux")]
         if device.uses_bluez_gatt_transport() {
             match crate::linux_ble::LinuxBleDevice::open(device) {
                 Ok(bluez_device) => {
-                    log::info!(
-                        "Using direct BlueZ GATT for Bluetooth device {}",
-                        device.name
-                    );
                     return Ok(Self {
                         backend: HidBackend::LinuxBle(bluez_device),
-                    });
+                    })
                 }
-                Err(error) => {
-                    log::warn!(
-                        "Direct BlueZ GATT unavailable for {}: {error:#}; \
-                         falling back to the Linux kernel HID transport",
-                        device.name
-                    );
-                }
+                Err(error) => log::warn!(
+                    "Direct BlueZ GATT unavailable: {error:#}; trying validated kernel HID"
+                ),
             }
-            return Self::open_fresh_for_local(device)
-                .context("Failed to open the Linux Bluetooth Vial transport");
         }
+        Self::open_fresh_for_local(device)
+    }
 
-        #[cfg(target_os = "windows")]
-        {
-            return Self::open_proxy_for(device);
-        }
-
-        #[cfg(not(target_os = "windows"))]
-        {
-            Self::open_fresh_for_local(device)
+    /// Only dedicated owners may use this handle. A shared-output consumer must
+    /// not revoke the selected keyboard's transport when its own bridge stops.
+    pub(crate) fn retirement_handle(&self) -> Option<HidRetirement> {
+        match &self.backend {
+            HidBackend::Proxy(proxy) => Some(proxy.retirement_handle()),
+            _ => None,
         }
     }
 
     pub(crate) fn shared_output(&self) -> Option<SharedHidOutput> {
         match &self.backend {
-            #[cfg(target_os = "windows")]
             HidBackend::Proxy(proxy) => Some(SharedHidOutput {
+                host_output: proxy.host_output.clone(),
+                host_lease: None,
                 backend: SharedHidOutputBackend::Proxy(std::sync::Arc::downgrade(proxy)),
             }),
             #[cfg(test)]
             HidBackend::Test { recorder, .. } => Some(SharedHidOutput {
+                host_output: recorder.host_output.clone(),
+                host_lease: None,
                 backend: SharedHidOutputBackend::Test(recorder.clone()),
             }),
             _ => None,
@@ -607,65 +606,9 @@ impl HidDevice {
         Err(last_error.unwrap_or_else(|| anyhow::anyhow!("unable to open the device")))
     }
 
-    #[cfg(target_os = "windows")]
     fn open_proxy_for(device: &crate::device::Device) -> Result<Self> {
-        let exe = std::env::current_exe().context("Failed to find Entropy executable")?;
-        let device_json =
-            serde_json::to_string(device).context("Failed to serialize HID device")?;
-        let mut child = Command::new(exe)
-            .arg("--entropy-hid-proxy")
-            .arg(device_json)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .context("Failed to start HID helper")?;
-
-        let stdin = child.stdin.take().context("HID helper stdin unavailable")?;
-        let stdout = child
-            .stdout
-            .take()
-            .context("HID helper stdout unavailable")?;
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines() {
-                match line {
-                    Ok(line) => {
-                        if tx.send(line).is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-
-        let ready_line = match rx.recv_timeout(Duration::from_secs(12)) {
-            Ok(line) => line,
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                bail!("HID helper timed out while opening device");
-            }
-        };
-        let ready: ProxyResponse = serde_json::from_str(&ready_line)
-            .context("HID helper returned malformed startup response")?;
-        if !ready.ok {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!(ready
-                .error
-                .unwrap_or_else(|| "HID helper failed to open device".to_owned()));
-        }
-
         Ok(Self {
-            backend: HidBackend::Proxy(std::sync::Arc::new(HidProxy {
-                request_lock: Mutex::new(()),
-                child: Mutex::new(child),
-                stdin: Mutex::new(stdin),
-                rx: Mutex::new(rx),
-                transport: device_transport(device),
-            })),
+            backend: HidBackend::Proxy(std::sync::Arc::new(HidProxy::open(device)?)),
         })
     }
 
@@ -673,49 +616,41 @@ impl HidDevice {
         #[cfg(target_os = "macos")]
         let _hid_lock = macos_hid_operation_lock();
         let api = hidapi::HidApi::new().context("Failed to init hidapi")?;
-
-        if !device.path.is_empty() {
-            if let Ok(path) = std::ffi::CString::new(device.path.as_str()) {
-                match api.open_path(&path) {
-                    Ok(hid_device) => {
-                        let transport = device_transport(device);
-                        let write_framing = detect_hid_write_framing(&hid_device, transport)?;
-                        return Ok(Self {
-                            backend: HidBackend::Local {
-                                device: hid_device,
-                                transport,
-                                write_framing,
-                                path: local_hid_path(device),
-                                input_report_polling: std::sync::atomic::AtomicBool::new(false),
-                            },
-                        });
-                    }
-                    Err(e) => {
-                        #[cfg(target_os = "macos")]
-                        if macos_hid_open_not_permitted(&e) {
-                            return Err(MacosHidInputMonitoringRequired.into());
-                        }
-                        log::debug!("direct HID path open failed, falling back to scan: {e}");
-                    }
-                }
-            }
-        }
-
-        for info in api.device_list() {
-            if !device_info_matches(info, device, true) {
-                continue;
-            }
-            let path = PathBuf::from(info.path().to_string_lossy().into_owned());
+        // Direct and fallback paths use the exact same eligibility checks.
+        // Never open a stale path before validating the current enumeration.
+        let mut candidates: Vec<_> = api
+            .device_list()
+            .filter(|info| device_info_matches(info, device))
+            .collect();
+        candidates.sort_by_key(|info| info.path().to_string_lossy() != device.path);
+        for info in candidates {
+            let before = device_from_info(info);
+            claim_open_target(&before)?;
             let hid_device = match info.open_device(&api) {
-                Ok(device) => device,
+                Ok(opened) => opened,
                 Err(error) => {
                     #[cfg(target_os = "macos")]
                     if macos_hid_open_not_permitted(&error) {
                         return Err(MacosHidInputMonitoringRequired.into());
                     }
-                    return Err(error).context("Failed to open HID device");
+                    log::debug!("Validated HID open failed: {error}");
+                    continue;
                 }
             };
+            let opened_info = hid_device
+                .get_device_info()
+                .context("Failed to validate opened HID identity")?;
+            let after = device_from_info(&opened_info);
+            // Linux get_device_info() returns the first collection on a
+            // multi-collection hidraw node, not necessarily its Vial collection.
+            // Vial usage was checked in enumeration above; validate the actual
+            // handle's physical identity here without rejecting that layout.
+            if !device.permits_hid_target(&after)
+                || before.path != after.path
+                || before.instance_token != after.instance_token
+            {
+                bail!("HID device disconnected or endpoint identity changed during open");
+            }
             let transport = device_transport(device);
             let write_framing = detect_hid_write_framing(&hid_device, transport)?;
             return Ok(Self {
@@ -723,41 +658,12 @@ impl HidDevice {
                     device: hid_device,
                     transport,
                     write_framing,
-                    path: Some(path),
+                    path: Some(PathBuf::from(after.path)),
                     input_report_polling: std::sync::atomic::AtomicBool::new(false),
                 },
             });
         }
-
-        for info in api.device_list() {
-            if !device_info_matches(info, device, false) {
-                continue;
-            }
-            let path = PathBuf::from(info.path().to_string_lossy().into_owned());
-            let hid_device = match info.open_device(&api) {
-                Ok(device) => device,
-                Err(error) => {
-                    #[cfg(target_os = "macos")]
-                    if macos_hid_open_not_permitted(&error) {
-                        return Err(MacosHidInputMonitoringRequired.into());
-                    }
-                    return Err(error).context("Failed to open HID device");
-                }
-            };
-            let transport = device_transport(device);
-            let write_framing = detect_hid_write_framing(&hid_device, transport)?;
-            return Ok(Self {
-                backend: HidBackend::Local {
-                    device: hid_device,
-                    transport,
-                    write_framing,
-                    path: Some(path),
-                    input_report_polling: std::sync::atomic::AtomicBool::new(false),
-                },
-            });
-        }
-
-        anyhow::bail!("HID device disappeared during reconnect")
+        bail!("HID device disconnected or no identity-safe endpoint remains")
     }
 
     /// Write one padded Vial Raw HID output report without waiting for a reply.
@@ -774,7 +680,6 @@ impl HidDevice {
                 path,
                 ..
             } => write_output_report_local(device, *write_framing, path.as_deref(), data),
-            #[cfg(target_os = "windows")]
             HidBackend::Proxy(proxy) => proxy.write_output_report(data),
             #[cfg(target_os = "linux")]
             HidBackend::LinuxBle(device) => device.write_output_report(data),
@@ -788,6 +693,30 @@ impl HidDevice {
 
     /// Send exactly MSG_LEN bytes (with 0x00 report ID prepended), receive MSG_LEN bytes back.
     pub(crate) fn usb_send(&self, data: &[u8]) -> Result<[u8; MSG_LEN]> {
+        let trace = log::log_enabled!(log::Level::Debug)
+            .then(|| display_diagnostic_request(data))
+            .flatten();
+        let Some(trace) = trace else {
+            return self.usb_send_untraced(data);
+        };
+        let started = std::time::Instant::now();
+        log::debug!("Display HID request: {trace}");
+        let result = self.usb_send_untraced(data);
+        match &result {
+            Ok(response) => log::debug!(
+                "Display HID response: {trace} elapsed_ms={} {}",
+                started.elapsed().as_millis(),
+                display_diagnostic_response(data, response),
+            ),
+            Err(error) => log::debug!(
+                "Display HID error: {trace} elapsed_ms={} error={error:#}",
+                started.elapsed().as_millis(),
+            ),
+        }
+        result
+    }
+
+    fn usb_send_untraced(&self, data: &[u8]) -> Result<[u8; MSG_LEN]> {
         match &self.backend {
             HidBackend::Local {
                 device,
@@ -803,7 +732,6 @@ impl HidDevice {
                 input_report_polling,
                 data,
             ),
-            #[cfg(target_os = "windows")]
             HidBackend::Proxy(proxy) => proxy.usb_send(data),
             #[cfg(target_os = "linux")]
             HidBackend::LinuxBle(device) => {
@@ -854,6 +782,9 @@ impl HidDevice {
                     }
                 }
 
+                if let Some(response) = recorder.responses.lock().unwrap().pop_front() {
+                    return Ok(response);
+                }
                 let mut response = [0; MSG_LEN];
                 match (request[0], request[1], request[2]) {
                     (CMD_VIA_MACRO_GET_BUFFER_SIZE, _, _) => {
@@ -918,11 +849,6 @@ fn device_transport(device: &crate::device::Device) -> HidTransport {
     } else {
         HidTransport::Usb
     }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn local_hid_path(device: &crate::device::Device) -> Option<PathBuf> {
-    (!device.path.is_empty()).then(|| PathBuf::from(&device.path))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -997,6 +923,11 @@ fn is_optional_qmk_settings_query(data: &[u8]) -> bool {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn is_qmk_settings_get(data: &[u8]) -> bool {
+    data.starts_with(&[CMD_VIA_VIAL_PREFIX, CMD_VIAL_QMK_SETTINGS_GET])
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn is_keymap_read_request(data: &[u8]) -> bool {
     matches!(
         data.first(),
@@ -1014,6 +945,17 @@ fn is_optional_dynamic_entry_count_request(data: &[u8]) -> bool {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn usb_read_timeout_ms(transport: HidTransport, data: &[u8]) -> i32 {
+    if transport.is_bluetooth() {
+        WINDOWS_BLE_READ_TIMEOUT_MS
+    } else if data.first() == Some(&0xC9) {
+        PICTOGRAM_SLOT_COMMIT_READ_TIMEOUT_MS
+    } else {
+        VIAL_GUI_READ_TIMEOUT_MS
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn usb_send_max_attempts(transport: HidTransport, data: &[u8]) -> usize {
     // Runtime firmware metadata and optional QMK-settings discovery both have
     // safe fallbacks, so an unsupported probe must not hold up the whole
@@ -1021,14 +963,73 @@ fn usb_send_max_attempts(transport: HidTransport, data: &[u8]) -> usize {
     if transport.is_bluetooth()
         || is_optional_firmware_version_request(data)
         || is_optional_qmk_settings_query(data)
+        || is_qmk_settings_get(data)
         || is_keymap_read_request(data)
         || crate::rmk_native::is_rmk_native_capabilities_request(data)
         || is_optional_dynamic_entry_count_request(data)
+        || data.first().is_some_and(|command| {
+            // Pictogram BEGIN/DATA/COMMIT are not idempotent: replay can
+            // restart storage, fail sequence checks, or reject a committed upload.
+            // Safe QUERY/READ commands retain the normal retry budget.
+            // A missing write ACK is an uncertain result, never permission to resend.
+            (0xB0..=0xB7).contains(command)
+                || matches!(command, 0xC2 | 0xC3 | 0xC4 | 0xC7 | 0xC8 | 0xC9)
+                || (0xD0..=0xD5).contains(command)
+        })
     {
         1
     } else {
         VIAL_GUI_USB_RETRIES
     }
+}
+
+/// Trace only display-transfer metadata and unlock control, never keymaps,
+/// macro contents, image bytes or the physical unlock key coordinates.
+#[cfg(not(target_arch = "wasm32"))]
+fn display_diagnostic_request(data: &[u8]) -> Option<String> {
+    let command = *data.first()?;
+    if (0xC0..=0xCB).contains(&command) {
+        let mut trace = format!("opcode=0x{command:02X} bytes={}", data.len());
+        if matches!(command, 0xC3 | 0xC8) && data.len() >= 3 {
+            trace.push_str(&format!(
+                " sequence={}",
+                u16::from_le_bytes([data[1], data[2]])
+            ));
+        } else if command == 0xC7 && data.len() >= 4 {
+            trace.push_str(&format!(
+                " kind={} slot={}",
+                data[1],
+                u16::from_le_bytes([data[2], data[3]])
+            ));
+        }
+        Some(trace)
+    } else if command == CMD_VIA_VIAL_PREFIX
+        && data
+            .get(1)
+            .is_some_and(|subcommand| (0x05..=0x08).contains(subcommand))
+    {
+        Some(format!(
+            "opcode=0xFE subcommand=0x{:02X} bytes={}",
+            data[1],
+            data.len()
+        ))
+    } else {
+        None
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn display_diagnostic_response(request: &[u8], response: &[u8; MSG_LEN]) -> String {
+    let mut trace = format!("reply=0x{:02X} byte1={}", response[0], response[1]);
+    if request.first() == Some(&0xC0) && response[0] == 0xC0 {
+        trace.push_str(&format!(
+            " format={} valid={} slot_protocol={} write_format={}",
+            response[2], response[3], response[16], response[17]
+        ));
+    } else if request.starts_with(&[CMD_VIA_VIAL_PREFIX, 0x07]) {
+        trace.push_str(&format!(" counter={}", response[2]));
+    }
+    trace
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1054,11 +1055,7 @@ fn usb_send_local(
     write_buf[1..1 + data.len()].copy_from_slice(data);
     let write_frame = local_hid_write_frame(&mut write_buf, write_framing);
 
-    let read_timeout_ms = if transport.is_bluetooth() {
-        WINDOWS_BLE_READ_TIMEOUT_MS
-    } else {
-        VIAL_GUI_READ_TIMEOUT_MS
-    };
+    let read_timeout_ms = usb_read_timeout_ms(transport, data);
 
     let max_retries = usb_send_max_attempts(transport, data);
 
@@ -1575,6 +1572,9 @@ fn response_matches_command(command: &[u8], resp: &[u8; MSG_LEN]) -> bool {
         | CMD_VIA_LIGHTING_SAVE
         | CMD_VIA_MACRO_SET_BUFFER => resp[0] == cmd,
         CMD_VIA_VIAL_PREFIX => response_matches_vial_command(command, resp),
+        // Keep reading for this command within the original deadline when a
+        // delayed response from another pictogram command arrives. Never resend.
+        0xC0..=0xCB => resp[0] == cmd,
         _ => true,
     }
 }
@@ -1696,203 +1696,6 @@ fn drain_pending_reports(device: &hidapi::HidDevice) {
     }
 }
 
-#[cfg(target_os = "windows")]
-impl HidProxy {
-    fn is_bluetooth_transport(&self) -> bool {
-        self.transport.is_bluetooth()
-    }
-
-    fn command_timeout(&self) -> Duration {
-        if self.transport.is_bluetooth() {
-            WINDOWS_HID_HELPER_BLE_COMMAND_TIMEOUT
-        } else {
-            WINDOWS_HID_HELPER_USB_COMMAND_TIMEOUT
-        }
-    }
-
-    fn kill_child(&self) {
-        if let Ok(mut child) = self.child.lock() {
-            let _ = child.kill();
-            let _ = child.try_wait();
-        }
-    }
-
-    fn request(&self, request: &str) -> Result<String> {
-        let _request_guard = self
-            .request_lock
-            .lock()
-            .map_err(|_| anyhow::anyhow!("HID helper request lock poisoned"))?;
-        {
-            let mut stdin = self
-                .stdin
-                .lock()
-                .map_err(|_| anyhow::anyhow!("HID helper stdin lock poisoned"))?;
-            writeln!(stdin, "{request}").context("Failed to write HID helper request")?;
-            stdin
-                .flush()
-                .context("Failed to flush HID helper request")?;
-        }
-
-        let rx = self
-            .rx
-            .lock()
-            .map_err(|_| anyhow::anyhow!("HID helper receiver lock poisoned"))?;
-        match rx.recv_timeout(self.command_timeout()) {
-            Ok(line) => Ok(line),
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                self.kill_child();
-                bail!("HID helper timed out during command");
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                bail!("HID helper disconnected during command");
-            }
-        }
-    }
-
-    fn usb_send(&self, data: &[u8]) -> Result<[u8; MSG_LEN]> {
-        if data.len() > MSG_LEN {
-            bail!(
-                "HID command too long — {} bytes, max {} bytes",
-                data.len(),
-                MSG_LEN
-            );
-        }
-
-        let line = self.request(&bytes_to_hex(data))?;
-        let response: ProxyResponse =
-            serde_json::from_str(&line).context("HID helper returned malformed response")?;
-        if !response.ok {
-            bail!(response
-                .error
-                .unwrap_or_else(|| "HID helper command failed".to_owned()));
-        }
-
-        let bytes = hex_to_bytes(
-            response
-                .data
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("HID helper response missing data"))?,
-        )?;
-        if bytes.len() != MSG_LEN {
-            bail!(
-                "HID helper invalid response length — {} bytes, expected {}",
-                bytes.len(),
-                MSG_LEN
-            );
-        }
-        let mut out = [0u8; MSG_LEN];
-        out.copy_from_slice(&bytes);
-        Ok(out)
-    }
-
-    fn write_output_report(&self, data: &[u8]) -> Result<()> {
-        let request = format!("{HID_PROXY_OUTPUT_PREFIX}{}", bytes_to_hex(data));
-        let line = self.request(&request)?;
-        let response: ProxyResponse =
-            serde_json::from_str(&line).context("HID helper returned malformed response")?;
-        if !response.ok {
-            bail!(response
-                .error
-                .unwrap_or_else(|| "HID helper output report failed".to_owned()));
-        }
-        Ok(())
-    }
-}
-
-#[cfg(target_os = "windows")]
-pub fn run_hid_proxy_if_requested() -> bool {
-    let mut args = std::env::args();
-    let _exe = args.next();
-    if args.next().as_deref() != Some("--entropy-hid-proxy") {
-        return false;
-    }
-
-    let result = (|| -> Result<()> {
-        let device_json = args
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("missing HID helper device argument"))?;
-        let device: crate::device::Device = serde_json::from_str(&device_json)
-            .context("Failed to parse HID helper device argument")?;
-        run_hid_proxy(device)
-    })();
-
-    if let Err(e) = result {
-        let response = serde_json::to_string(&ProxyResponse {
-            ok: false,
-            data: None,
-            error: Some(e.to_string()),
-        })
-        .unwrap_or_else(|_| {
-            "{\"ok\":false,\"data\":null,\"error\":\"HID helper failed\"}".to_owned()
-        });
-        let _ = writeln!(std::io::stdout(), "{}", response);
-        let _ = std::io::stdout().flush();
-    }
-    true
-}
-
-#[cfg(target_os = "windows")]
-fn run_hid_proxy(device: crate::device::Device) -> Result<()> {
-    let hid = HidDevice::open_fresh_for_local(&device)?;
-    writeln!(
-        std::io::stdout(),
-        "{}",
-        serde_json::to_string(&ProxyResponse {
-            ok: true,
-            data: None,
-            error: None,
-        })?
-    )?;
-    std::io::stdout().flush()?;
-
-    for line in BufReader::new(std::io::stdin()).lines() {
-        let line = line?;
-        let line = line.trim();
-        let response = if let Some(encoded) = line.strip_prefix(HID_PROXY_OUTPUT_PREFIX) {
-            match hex_to_bytes(encoded).and_then(|data| hid.write_output_report(&data)) {
-                Ok(()) => ProxyResponse {
-                    ok: true,
-                    data: None,
-                    error: None,
-                },
-                Err(e) => ProxyResponse {
-                    ok: false,
-                    data: None,
-                    error: Some(e.to_string()),
-                },
-            }
-        } else {
-            match hex_to_bytes(line).and_then(|data| hid.usb_send(&data)) {
-                Ok(data) => ProxyResponse {
-                    ok: true,
-                    data: Some(bytes_to_hex(&data)),
-                    error: None,
-                },
-                Err(e) => ProxyResponse {
-                    ok: false,
-                    data: None,
-                    error: Some(e.to_string()),
-                },
-            }
-        };
-        writeln!(std::io::stdout(), "{}", serde_json::to_string(&response)?)?;
-        std::io::stdout().flush()?;
-    }
-
-    Ok(())
-}
-
-#[cfg(target_os = "windows")]
-fn bytes_to_hex(data: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(data.len() * 2);
-    for &byte in data {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0F) as usize] as char);
-    }
-    out
-}
-
 #[cfg(target_os = "macos")]
 fn prepare_macos_bluetooth_hid_access(device: &crate::device::Device) -> Result<()> {
     if !device.is_bluetooth_transport() || crate::smart_input::input_monitoring_access_granted() {
@@ -1912,34 +1715,67 @@ fn macos_hid_open_not_permitted(error: &hidapi::HidError) -> bool {
     message.contains("0xe00002e2") || message.contains("not permitted")
 }
 
-#[cfg(target_os = "windows")]
-fn hex_to_bytes(hex: &str) -> Result<Vec<u8>> {
-    if hex.len() % 2 != 0 {
-        bail!("invalid hex length");
-    }
-    let mut out = Vec::with_capacity(hex.len() / 2);
-    let bytes = hex.as_bytes();
-    for pair in bytes.chunks_exact(2) {
-        let high = hex_nibble(pair[0])?;
-        let low = hex_nibble(pair[1])?;
-        out.push((high << 4) | low);
-    }
-    Ok(out)
-}
-
-#[cfg(target_os = "windows")]
-fn hex_nibble(byte: u8) -> Result<u8> {
-    match byte {
-        b'0'..=b'9' => Ok(byte - b'0'),
-        b'a'..=b'f' => Ok(byte - b'a' + 10),
-        b'A'..=b'F' => Ok(byte - b'A' + 10),
-        _ => bail!("invalid hex digit"),
-    }
-}
-
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_diagnostics_exclude_keymaps_macros_and_pixel_payloads() {
+        for request in [
+            vec![],
+            vec![0x04, 7, 8],
+            vec![0x0F, 1, 2],
+            vec![0xFE, 0x0D, 3],
+        ] {
+            assert!(display_diagnostic_request(&request).is_none());
+        }
+        let mut packet = [0x41; MSG_LEN];
+        packet[..3].copy_from_slice(&[0xC8, 2, 0]);
+        assert_eq!(
+            display_diagnostic_request(&packet).unwrap(),
+            "opcode=0xC8 bytes=32 sequence=2"
+        );
+        packet[..4].copy_from_slice(&[0xC7, 1, 24, 0]);
+        assert_eq!(
+            display_diagnostic_request(&packet).unwrap(),
+            "opcode=0xC7 bytes=32 kind=1 slot=24"
+        );
+        // C1/CB responses contain user pixels after the two protocol bytes.
+        packet[..2].copy_from_slice(&[0xCB, 0]);
+        assert_eq!(
+            display_diagnostic_response(&[0xCB], &packet),
+            "reply=0xCB byte1=0"
+        );
+        // FE05 contains physical unlock key coordinates after its flags.
+        packet[..2].copy_from_slice(&[0, 1]);
+        assert_eq!(
+            display_diagnostic_response(&[0xFE, 5], &packet),
+            "reply=0x00 byte1=1"
+        );
+    }
+
+    #[test]
+    fn display_diagnostics_include_capabilities_and_rejected_reply_prefix() {
+        let mut response = [0; MSG_LEN];
+        response[0] = 0xC0;
+        response[2] = 4;
+        response[3] = 1;
+        response[16] = 2;
+        response[17] = 4;
+        assert_eq!(
+            display_diagnostic_response(&[0xC0], &response),
+            "reply=0xC0 byte1=0 format=4 valid=1 slot_protocol=2 write_format=4"
+        );
+        response[..2].copy_from_slice(&[0xC9, 7]);
+        assert_eq!(
+            display_diagnostic_response(&[0xC0], &response),
+            "reply=0xC9 byte1=7"
+        );
+        assert_eq!(
+            display_diagnostic_request(&[0xFE, 8]).unwrap(),
+            "opcode=0xFE subcommand=0x08 bytes=2"
+        );
+    }
 
     #[test]
     fn write_only_output_report_uses_the_hid_transport_owner() {
@@ -2181,6 +2017,15 @@ mod tests {
     }
 
     #[test]
+    fn qmk_settings_reads_and_standby_session_use_one_usb_attempt() {
+        let qmk_get = [CMD_VIA_VIAL_PREFIX, CMD_VIAL_QMK_SETTINGS_GET, 0, 0];
+
+        assert_eq!(usb_send_max_attempts(HidTransport::Usb, &qmk_get), 1);
+        assert_eq!(usb_send_max_attempts(HidTransport::Usb, &[0xB6, 1]), 1);
+        assert_eq!(usb_send_max_attempts(HidTransport::Usb, &[0xB7, 100, 0]), 1);
+    }
+
+    #[test]
     fn optional_qmk_compatibility_probes_use_one_usb_attempt() {
         let rmk_capabilities = [
             CMD_VIA_CUSTOM_GET_VALUE,
@@ -2244,6 +2089,52 @@ mod tests {
             usb_send_max_attempts(HidTransport::Usb, &dynamic_entry_read),
             VIAL_GUI_USB_RETRIES
         );
+    }
+
+    #[test]
+    fn only_pictogram_slot_commit_gets_the_extended_usb_response_window() {
+        assert_eq!(
+            usb_read_timeout_ms(HidTransport::Usb, &[0xC9]),
+            PICTOGRAM_SLOT_COMMIT_READ_TIMEOUT_MS
+        );
+        for command in [0xC0, 0xC7, 0xC8, 0xCA, 0xCB] {
+            assert_eq!(
+                usb_read_timeout_ms(HidTransport::Usb, &[command]),
+                VIAL_GUI_READ_TIMEOUT_MS,
+                "unexpected extended timeout for opcode 0x{command:02X}"
+            );
+        }
+        assert_eq!(
+            usb_read_timeout_ms(HidTransport::Bluetooth, &[0xC9]),
+            WINDOWS_BLE_READ_TIMEOUT_MS
+        );
+    }
+
+    #[test]
+    fn pictogram_writes_are_one_shot_but_safe_reads_keep_retries() {
+        for command in [0xC2, 0xC3, 0xC4, 0xC7, 0xC8, 0xC9] {
+            assert_eq!(
+                usb_send_max_attempts(HidTransport::Usb, &[command]),
+                1,
+                "non-idempotent pictogram opcode 0x{command:02X} retried"
+            );
+        }
+        for command in [0xC0, 0xC1, 0xCA, 0xCB] {
+            assert_eq!(
+                usb_send_max_attempts(HidTransport::Usb, &[command]),
+                VIAL_GUI_USB_RETRIES,
+                "safe pictogram opcode 0x{command:02X} lost its retry budget"
+            );
+        }
+    }
+
+    #[test]
+    fn pictogram_response_requires_the_current_opcode() {
+        let mut response = [0u8; MSG_LEN];
+        response[0] = 0xC4;
+        assert!(!response_matches_command(&[0xC9], &response));
+        response[0] = 0xC9;
+        assert!(response_matches_command(&[0xC9], &response));
     }
 
     #[test]

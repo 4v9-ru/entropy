@@ -37,6 +37,14 @@ impl HidDevice {
     }
 
     pub fn get_layout_json_with_size(&self, sz: u32) -> Result<serde_json::Value> {
+        self.get_layout_json_with_size_and_progress(sz, |_, _| Ok(()))
+    }
+
+    pub fn get_layout_json_with_size_and_progress(
+        &self,
+        sz: u32,
+        mut progress: impl FnMut(usize, usize) -> Result<()>,
+    ) -> Result<serde_json::Value> {
         let sz = sz as usize;
         if sz == 0 || sz > 2_000_000 {
             bail!("Invalid definition size: {sz}");
@@ -46,6 +54,8 @@ impl HidDevice {
         let mut payload = Vec::with_capacity(sz);
         let mut block: u32 = 0;
         let mut remaining = sz;
+        let total_blocks = sz.div_ceil(MSG_LEN);
+        progress(0, total_blocks)?;
 
         while remaining > 0 {
             let mut cmd = [0u8; MSG_LEN];
@@ -60,6 +70,10 @@ impl HidDevice {
             payload.extend_from_slice(&resp[..chunk]);
             remaining -= chunk;
             block += 1;
+            let completed = block as usize;
+            if completed == total_blocks || completed % 32 == 0 {
+                progress(completed, total_blocks)?;
+            }
         }
 
         // Decompress: vial uses Python lzma which defaults to XZ container format
@@ -80,15 +94,23 @@ impl HidDevice {
         Ok(value)
     }
 
-    /// Check if keyboard is unlocked
-    /// Returns (unlocked, unlock_keys: Vec<(row,col)>)
+    /// Check whether the keyboard is ready for normal Vial commands.
+    /// A firmware may retain the unlocked bit while a new physical unlock hold
+    /// is pending; that state is not ready until the pending sequence finishes.
+    /// Returns (ready, unlock_keys: Vec<(row,col)>).
     pub fn get_unlock_status(&self) -> Result<(bool, Vec<(u8, u8)>)> {
+        let (unlocked, in_progress, keys) = self.get_unlock_status_with_progress()?;
+        Ok((unlocked && !in_progress, keys))
+    }
+
+    pub(crate) fn get_unlock_status_with_progress(&self) -> Result<(bool, bool, Vec<(u8, u8)>)> {
         let resp = self
             .usb_send(&[CMD_VIA_VIAL_PREFIX, CMD_VIAL_GET_UNLOCK_STATUS])
             .context("failed to read Vial unlock status")?;
         // resp[0] = unlocked (1=yes), resp[1] = unlock_in_progress
         // resp[2..] = pairs of (row, col), rest filled with 0xFF
-        Ok(parse_unlock_status_response(&resp))
+        let (unlocked, keys) = parse_unlock_status_response(&resp);
+        Ok((unlocked, resp.get(1).copied() == Some(1), keys))
     }
 
     /// Start unlock sequence — returns keys to hold (row, col pairs)
